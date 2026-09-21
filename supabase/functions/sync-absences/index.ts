@@ -10,337 +10,306 @@ type SyncPayload = {
   absences: Absence[];
 };
 
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SYNC_SECRET = Deno.env.get("SYNC_SECRET")!;
+
 const supabase = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
 );
 
-const SYNC_SECRET = Deno.env.get("SYNC_SECRET");
+const ALL_PERIODS = [
+  "igs",
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+];
 
+function normalizePeriods(rawValue: string): string {
+  const periods = new Set<string>();
+
+  const tokens = rawValue
+    .split(",")
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+
+  // "all" always means every period.
+  if (tokens.includes("all")) {
+    return ALL_PERIODS.join(", ");
+  }
+
+  for (const token of tokens) {
+    if (token === "igs") {
+      periods.add("igs");
+      continue;
+    }
+
+    // Single numerical period.
+    if (/^[1-9]$/.test(token)) {
+      periods.add(token);
+      continue;
+    }
+
+    // Numerical range, e.g. 2-5.
+    const rangeMatch = token.match(/^([1-9])-([1-9])$/);
+
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+
+      if (start <= end) {
+        for (let period = start; period <= end; period++) {
+          periods.add(String(period));
+        }
+      }
+    }
+  }
+
+  return [
+    ...(periods.has("igs") ? ["igs"] : []),
+    ...Array.from({ length: 9 }, (_, i) => String(i + 1))
+      .filter((period) => periods.has(period)),
+  ].join(", ");
+}
+
+function normalizeAbsences(absences: Absence[]): Absence[] {
+  return absences
+    .map((absence) => ({
+      teacher: absence.teacher.trim(),
+      periods_impacted: normalizePeriods(absence.periods_impacted),
+    }))
+    .filter(
+      (absence) =>
+        absence.teacher.length > 0 &&
+        absence.periods_impacted.length > 0,
+    )
+    .sort((a, b) => a.teacher.localeCompare(b.teacher));
+}
+
+function getTodayInNewYork(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+function jsonResponse(
+  body: Record<string, unknown>,
+  status = 200,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+    },
+  });
+}
 
 Deno.serve(async (req) => {
   try {
     if (req.method !== "POST") {
       return jsonResponse(
         { error: "Method not allowed" },
-        405
+        405,
       );
     }
 
-    const authHeader = req.headers.get("Authorization");
+    const authorization = req.headers.get("Authorization");
 
-    if (
-      !SYNC_SECRET ||
-      authHeader !== `Bearer ${SYNC_SECRET}`
-    ) {
+    if (authorization !== `Bearer ${SYNC_SECRET}`) {
       return jsonResponse(
         { error: "Unauthorized" },
-        401
+        401,
       );
     }
 
     const payload = (await req.json()) as SyncPayload;
 
     if (
-      !payload.date ||
+      !payload ||
+      typeof payload.date !== "string" ||
       !Array.isArray(payload.absences)
     ) {
       return jsonResponse(
         { error: "Invalid payload" },
-        400
+        400,
       );
     }
 
-    /*
-     * Normalize every absence on the server.
-     */
-    const absences = payload.absences
-      .map((absence) => {
-        const teacher = String(absence.teacher).trim();
-
-        const periods = normalizePeriods(
-          String(absence.periods_impacted)
-        );
-
-        return {
-          teacher,
-          periods_impacted: periods,
-        };
-      })
-      .filter(
-        (absence) =>
-          absence.teacher.length > 0 &&
-          absence.periods_impacted.length > 0
-      );
+    const normalizedAbsences = normalizeAbsences(payload.absences);
+    const today = getTodayInNewYork();
 
     /*
-     * Sort teachers so row ordering never affects
-     * snapshot comparison.
+     * The Supabase table is a LIVE representation of today's
+     * cancellation data.
+     *
+     * If the Sheet contains anything other than today's date,
+     * the database must be empty.
      */
-    absences.sort((a, b) =>
-      a.teacher.localeCompare(b.teacher)
-    );
-
-    /*
-     * Get the timestamp of the latest complete snapshot.
-     */
-    const { data: latestRow, error: latestError } =
-      await supabase
+    if (payload.date !== today) {
+      const { error } = await supabase
         .from("teacher_absences")
-        .select("synced_at")
-        .eq("date", payload.date)
-        .order("synced_at", {
-          ascending: false,
-        })
-        .limit(1)
-        .maybeSingle();
+        .delete()
+        .not("id", "is", null);
 
-    if (latestError) {
-      throw latestError;
-    }
+      if (error) {
+        console.error("Failed to clear stale data:", error);
 
-    let previousSnapshot: Absence[] = [];
-
-    if (latestRow) {
-      const { data: snapshotRows, error: snapshotError } =
-        await supabase
-          .from("teacher_absences")
-          .select(
-            "teacher, periods_impacted"
-          )
-          .eq("date", payload.date)
-          .eq(
-            "synced_at",
-            latestRow.synced_at
-          );
-
-      if (snapshotError) {
-        throw snapshotError;
+        return jsonResponse(
+          {
+            error: "Failed to clear stale absence data",
+            details: error.message,
+          },
+          500,
+        );
       }
 
-      previousSnapshot = (snapshotRows ?? [])
-        .map((row) => ({
-          teacher: row.teacher,
-          periods_impacted:
-            normalizePeriods(
-              row.periods_impacted
-            ),
-        }))
-        .sort((a, b) =>
-          a.teacher.localeCompare(b.teacher)
-        );
-    }
-
-    /*
-     * Compare canonical data.
-     */
-    const changed =
-      JSON.stringify(absences) !==
-      JSON.stringify(previousSnapshot);
-
-    if (!changed) {
       return jsonResponse({
-        changed: false,
-        inserted: 0,
-        message: "No changes detected.",
+        success: true,
+        changed: true,
+        cleared: true,
+        reason: "Sheet date is not today",
+        sheet_date: payload.date,
+        today,
       });
     }
 
-    const syncedAt =
-      new Date().toISOString();
+    /*
+     * Get the current live state.
+     */
+    const { data: currentRows, error: fetchError } = await supabase
+      .from("teacher_absences")
+      .select("teacher, periods_impacted")
+      .eq("date", today)
+      .order("teacher", { ascending: true });
 
-    const rowsToInsert = absences.map(
-      (absence) => ({
-        date: payload.date,
-        synced_at: syncedAt,
-        teacher: absence.teacher,
-        periods_impacted:
-          absence.periods_impacted,
-      })
+    if (fetchError) {
+      console.error("Failed to fetch current data:", fetchError);
+
+      return jsonResponse(
+        {
+          error: "Failed to fetch current absence data",
+          details: fetchError.message,
+        },
+        500,
+      );
+    }
+
+    const currentAbsences = normalizeAbsences(
+      (currentRows ?? []).map((row) => ({
+        teacher: row.teacher,
+        periods_impacted: row.periods_impacted,
+      })),
     );
 
-    /*
-     * Insert the entire new snapshot.
-     *
-     * No existing rows are updated or deleted.
-     */
-    if (rowsToInsert.length > 0) {
-      const { error: insertError } =
-        await supabase
-          .from("teacher_absences")
-          .insert(rowsToInsert);
+    const currentSnapshot = JSON.stringify(currentAbsences);
+    const incomingSnapshot = JSON.stringify(normalizedAbsences);
 
-      if (insertError) {
-        throw insertError;
-      }
+    /*
+     * Nothing changed. Leave Supabase completely untouched.
+     */
+    if (currentSnapshot === incomingSnapshot) {
+      return jsonResponse({
+        success: true,
+        changed: false,
+        cleared: false,
+        date: today,
+        count: normalizedAbsences.length,
+      });
+    }
+
+    /*
+     * Something changed.
+     *
+     * Replace the entire live snapshot. This handles:
+     * - new teachers
+     * - removed teachers
+     * - changed periods
+     * - all -> specific periods
+     * - specific periods -> all
+     * - going from data -> zero absences
+     */
+    const { error: deleteError } = await supabase
+      .from("teacher_absences")
+      .delete()
+      .not("id", "is", null);
+
+    if (deleteError) {
+      console.error("Failed to clear old snapshot:", deleteError);
+
+      return jsonResponse(
+        {
+          error: "Failed to clear old absence snapshot",
+          details: deleteError.message,
+        },
+        500,
+      );
+    }
+
+    /*
+     * Empty snapshot is valid. The table simply remains empty.
+     */
+    if (normalizedAbsences.length === 0) {
+      return jsonResponse({
+        success: true,
+        changed: true,
+        cleared: true,
+        date: today,
+        count: 0,
+      });
+    }
+
+    const syncedAt = new Date().toISOString();
+
+    const rowsToInsert = normalizedAbsences.map((absence) => ({
+      date: today,
+      synced_at: syncedAt,
+      teacher: absence.teacher,
+      periods_impacted: absence.periods_impacted,
+    }));
+
+    const { error: insertError } = await supabase
+      .from("teacher_absences")
+      .insert(rowsToInsert);
+
+    if (insertError) {
+      console.error("Failed to insert new snapshot:", insertError);
+
+      return jsonResponse(
+        {
+          error: "Failed to insert new absence snapshot",
+          details: insertError.message,
+        },
+        500,
+      );
     }
 
     return jsonResponse({
+      success: true,
       changed: true,
-      inserted: rowsToInsert.length,
+      cleared: false,
+      date: today,
+      count: normalizedAbsences.length,
       synced_at: syncedAt,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Unexpected error:", error);
 
     return jsonResponse(
       {
         error: "Internal server error",
+        details: error instanceof Error ? error.message : String(error),
       },
-      500
+      500,
     );
   }
 });
-
-
-/**
- * Normalizes a periods string into canonical form.
- *
- * Examples:
- *
- * all
- * → igs, 1, 2, 3, 4, 5, 6, 7, 8, 9
- *
- * 1-3, 2, igs
- * → igs, 1, 2, 3
- *
- * 2-3, nonsense, igs
- * → igs, 2, 3
- */
-function normalizePeriods(
-  rawValue: string
-): string {
-  const tokens = rawValue
-    .split(",")
-    .map((token) =>
-      token.trim().toLowerCase()
-    )
-    .filter((token) => token.length > 0);
-
-  const periods = new Set<string>();
-
-  for (const token of tokens) {
-    /*
-     * "all" has absolute priority.
-     */
-    if (token === "all") {
-      return [
-        "igs",
-        "1",
-        "2",
-        "3",
-        "4",
-        "5",
-        "6",
-        "7",
-        "8",
-        "9",
-      ].join(", ");
-    }
-
-    /*
-     * IGS.
-     */
-    if (token === "igs") {
-      periods.add("igs");
-      continue;
-    }
-
-    /*
-     * Single numerical period.
-     */
-    if (/^\d+$/.test(token)) {
-      const period = Number(token);
-
-      if (period >= 1 && period <= 9) {
-        periods.add(String(period));
-      }
-
-      continue;
-    }
-
-    /*
-     * Numerical range.
-     */
-    const rangeMatch =
-      token.match(
-        /^(\d+)\s*-\s*(\d+)$/
-      );
-
-    if (rangeMatch) {
-      const start = Number(
-        rangeMatch[1]
-      );
-
-      const end = Number(
-        rangeMatch[2]
-      );
-
-      if (
-        start >= 1 &&
-        start <= 9 &&
-        end >= 1 &&
-        end <= 9 &&
-        start <= end
-      ) {
-        for (
-          let period = start;
-          period <= end;
-          period++
-        ) {
-          periods.add(
-            String(period)
-          );
-        }
-      }
-    }
-
-    /*
-     * Anything else is ignored.
-     */
-  }
-
-  if (periods.size === 0) {
-    return "";
-  }
-
-  const result: string[] = [];
-
-  if (periods.has("igs")) {
-    result.push("igs");
-  }
-
-  for (
-    let period = 1;
-    period <= 9;
-    period++
-  ) {
-    if (
-      periods.has(String(period))
-    ) {
-      result.push(String(period));
-    }
-  }
-
-  return result.join(", ");
-}
-
-
-/**
- * Creates a JSON response.
- */
-function jsonResponse(
-  body: unknown,
-  status = 200
-): Response {
-  return new Response(
-    JSON.stringify(body),
-    {
-      status,
-      headers: {
-        "Content-Type":
-          "application/json",
-      },
-    }
-  );
-}
