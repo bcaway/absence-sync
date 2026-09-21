@@ -1,12 +1,8 @@
 create table public.teacher_absences (
     id uuid primary key default gen_random_uuid(),
-
     date date not null,
-
     synced_at timestamptz not null,
-
     teacher text not null,
-
     periods_impacted text not null
 );
 
