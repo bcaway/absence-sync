@@ -1,8 +1,4 @@
 const CONFIG = {
-  DOCUMENT_URL: PropertiesService
-    .getScriptProperties()
-    .getProperty("DOCUMENT_URL"),
-
   SUPABASE_URL: PropertiesService
     .getScriptProperties()
     .getProperty("SUPABASE_URL"),
@@ -15,12 +11,28 @@ const CONFIG = {
 
 /**
  * Main sync function.
+ *
+ * Google Sheet format:
+ *
+ * A1: Date
+ *
+ * A2: Teacher
+ * B2: Periods
+ *
+ * A3: Teacher
+ * B3: Periods
+ *
+ * Example:
+ *
+ * A1 = 9/20/2026
+ *
+ * A2 = Bian
+ * B2 = all
+ *
+ * A3 = Xu
+ * B3 = 1-3, 7-8, 5, igs
  */
 function syncAbsences() {
-  if (!CONFIG.DOCUMENT_URL) {
-    throw new Error("DOCUMENT_URL is not configured.");
-  }
-
   if (!CONFIG.SUPABASE_URL) {
     throw new Error("SUPABASE_URL is not configured.");
   }
@@ -29,74 +41,86 @@ function syncAbsences() {
     throw new Error("SYNC_SECRET is not configured.");
   }
 
-  const response = UrlFetchApp.fetch(CONFIG.DOCUMENT_URL, {
-    method: "get",
-    muteHttpExceptions: true,
-  });
-
-  const status = response.getResponseCode();
-
-  if (status !== 200) {
-    throw new Error(
-      "Failed to fetch Google Doc: HTTP " + status
-    );
-  }
-
-  const html = response.getContentText();
-
-  const data = parseDocument(html);
+  const data = readSheet();
 
   sendToSupabase(data);
 }
 
 
 /**
- * Parses the published Google Doc HTML.
- *
- * Expected document:
- *
- * BCA Class Cancellation List
- *
- * September 18, 2026
- *
- * Teacher | Periods Impacted
- * Bian | All Day
- * Cardenas | All Day
- * Molino | Periods 2-9
+ * Reads and parses the active Google Sheet.
  */
-function parseDocument(html) {
-  const text = htmlToText(html);
+function readSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
-  const date = findDate(text);
-
-  if (!date) {
+  if (!spreadsheet) {
     throw new Error(
-      "Could not find a date in the published document."
+      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet."
     );
   }
 
-  const table = extractFirstTable(html);
+  const sheet = spreadsheet.getActiveSheet();
 
-  if (!table || table.length < 2) {
-    throw new Error(
-      "Could not find a valid cancellation table."
-    );
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow < 1) {
+    throw new Error("The Google Sheet is empty.");
   }
+
+  /*
+   * A1 must contain the date.
+   */
+  const dateValue = sheet.getRange("A1").getValue();
+
+  const date = parseSheetDate(dateValue);
+
+  /*
+   * There are no teacher rows.
+   *
+   * We still return the date. The Supabase function can decide
+   * how to handle an empty snapshot.
+   */
+  if (lastRow < 2) {
+    return {
+      date: date,
+      absences: [],
+    };
+  }
+
+  /*
+   * Read columns A and B starting at row 2.
+   */
+  const values = sheet
+    .getRange(2, 1, lastRow - 1, 2)
+    .getValues();
 
   const absences = [];
 
-  // Skip the header row.
-  for (let i = 1; i < table.length; i++) {
-    const row = table[i];
+  for (const row of values) {
+    const teacher = String(row[0] ?? "").trim();
+    const rawPeriods = String(row[1] ?? "").trim();
 
-    if (row.length < 2) {
+    /*
+     * Ignore completely empty rows.
+     */
+    if (!teacher && !rawPeriods) {
       continue;
     }
 
-    const teacher = cleanText(row[0]);
-    const periodsImpacted = cleanText(row[1]);
+    /*
+     * A teacher without periods is invalid and therefore ignored.
+     */
+    if (!teacher || !rawPeriods) {
+      continue;
+    }
 
-    if (!teacher || !periodsImpacted) {
+    const periodsImpacted = parsePeriods(rawPeriods);
+
+    /*
+     * If nothing in the period field was parsable,
+     * ignore the row.
+     */
+    if (!periodsImpacted) {
       continue;
     }
 
@@ -106,11 +130,12 @@ function parseDocument(html) {
     });
   }
 
-  if (absences.length === 0) {
-    throw new Error(
-      "No teacher cancellation entries were found."
-    );
-  }
+  /*
+   * Sort teachers here so the payload is deterministic.
+   */
+  absences.sort((a, b) =>
+    a.teacher.localeCompare(b.teacher)
+  );
 
   return {
     date: date,
@@ -120,27 +145,19 @@ function parseDocument(html) {
 
 
 /**
- * Finds a date such as:
+ * Parses a Google Sheets date value into:
  *
- * September 18, 2026
+ * yyyy-MM-dd
  */
-function findDate(text) {
-  const match = text.match(
-    /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b/i
-  );
-
-  if (!match) {
-    return null;
-  }
-
-  const parsed = new Date(match[0]);
-
-  if (isNaN(parsed.getTime())) {
-    throw new Error("Found a date but could not parse it.");
+function parseSheetDate(value) {
+  if (!(value instanceof Date) || isNaN(value.getTime())) {
+    throw new Error(
+      "Cell A1 must contain a valid date."
+    );
   }
 
   return Utilities.formatDate(
-    parsed,
+    value,
     Session.getScriptTimeZone(),
     "yyyy-MM-dd"
   );
@@ -148,101 +165,127 @@ function findDate(text) {
 
 
 /**
- * Extracts HTML tables.
+ * Parses the raw periods string.
  *
- * Returns:
+ * Rules:
  *
- * [
- *   ["Teacher", "Periods Impacted"],
- *   ["Bian", "All Day"],
- *   ["Molino", "Periods 2-9"]
- * ]
+ * all
+ *   -> igs, 1, 2, 3, 4, 5, 6, 7, 8, 9
+ *
+ * igs
+ *   -> igs
+ *
+ * 2
+ *   -> 2
+ *
+ * 1-3
+ *   -> 1, 2, 3
+ *
+ * Invalid values are ignored.
+ *
+ * Duplicate periods are automatically removed.
  */
-function extractFirstTable(html) {
-  const tableMatch = html.match(
-    /<table[\s\S]*?<\/table>/i
-  );
+function parsePeriods(rawValue) {
+  const tokens = String(rawValue)
+    .split(",")
+    .map((token) => token.trim().toLowerCase())
+    .filter((token) => token.length > 0);
 
-  if (!tableMatch) {
-    return null;
-  }
+  const periods = new Set();
 
-  const tableHtml = tableMatch[0];
+  for (const token of tokens) {
+    /*
+     * "all" always wins.
+     */
+    if (token === "all") {
+      return "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9";
+    }
 
-  const rowMatches = tableHtml.match(
-    /<tr[\s\S]*?<\/tr>/gi
-  );
-
-  if (!rowMatches) {
-    return null;
-  }
-
-  const rows = [];
-
-  for (const rowHtml of rowMatches) {
-    const cellMatches = rowHtml.match(
-      /<(td|th)[^>]*>[\s\S]*?<\/\1>/gi
-    );
-
-    if (!cellMatches) {
+    /*
+     * IGS.
+     */
+    if (token === "igs") {
+      periods.add("igs");
       continue;
     }
 
-    const row = cellMatches.map((cell) => {
-      return cleanText(cell);
-    });
+    /*
+     * Single numerical period.
+     *
+     * Only 1 through 9 are valid.
+     */
+    if (/^\d+$/.test(token)) {
+      const period = Number(token);
 
-    if (row.length > 0) {
-      rows.push(row);
+      if (period >= 1 && period <= 9) {
+        periods.add(String(period));
+      }
+
+      continue;
+    }
+
+    /*
+     * Numerical range.
+     *
+     * Examples:
+     * 1-3
+     * 2-9
+     */
+    const rangeMatch = token.match(/^(\d+)\s*-\s*(\d+)$/);
+
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+
+      /*
+       * Invalid ranges are ignored.
+       */
+      if (
+        start >= 1 &&
+        start <= 9 &&
+        end >= 1 &&
+        end <= 9 &&
+        start <= end
+      ) {
+        for (let period = start; period <= end; period++) {
+          periods.add(String(period));
+        }
+      }
+
+      continue;
+    }
+
+    /*
+     * Anything else is intentionally ignored.
+     */
+  }
+
+  if (periods.size === 0) {
+    return "";
+  }
+
+  /*
+   * IGS must always come first.
+   * Numerical periods follow in ascending order.
+   */
+  const sortedPeriods = [];
+
+  if (periods.has("igs")) {
+    sortedPeriods.push("igs");
+  }
+
+  for (let period = 1; period <= 9; period++) {
+    if (periods.has(String(period))) {
+      sortedPeriods.push(String(period));
     }
   }
 
-  return rows;
+  return sortedPeriods.join(", ");
 }
 
 
 /**
- * Converts HTML into readable plain text.
- */
-function htmlToText(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<\/div>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#39;/gi, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-/**
- * Cleans a table cell while preserving the actual text.
- */
-function cleanText(value) {
-  return value
-    .replace(/<br\s*\/?>/gi, " ")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#39;/gi, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-/**
- * Sends the parsed snapshot to Supabase.
+ * Sends the normalized snapshot to Supabase.
  */
 function sendToSupabase(data) {
   const endpoint =
@@ -282,7 +325,7 @@ function sendToSupabase(data) {
 /**
  * Creates the five-minute trigger.
  *
- * Deletes an existing sync trigger first so running this
+ * Deletes existing sync triggers first so running this
  * function multiple times does not create duplicates.
  */
 function createFiveMinuteTrigger() {
