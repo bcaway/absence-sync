@@ -171,6 +171,14 @@ function sendToSupabase(data) {
 }
 
 function createFiveMinuteTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+
+  for (const trigger of triggers) {
+    if (trigger.getHandlerFunction() === "syncAbsences") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+
   ScriptApp
     .newTrigger("syncAbsences")
     .timeBased()
