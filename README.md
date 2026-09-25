@@ -30,12 +30,10 @@ Google Apps Script that fetches the published BCA Class Cancellation List docume
 4. (Optional) If editing the manifest, enable "Show appsscript.json manifest file in editor" under Project Settings and copy [`doc-to-sheets/appsscript.json`](./doc-to-sheets/appsscript.json).
 5. **Script Properties** (optional):
    - `DOC_URL`: The published doc URL (defaults to the BCA cancellation list `/pub` URL).
-   - `SHEET_NAME`: Name of the specific tab to write to (defaults to the active/first sheet).
-   - `SPREADSHEET_ID`: Only required if running as a standalone script rather than bound to the Google Sheet.
 6. **Automation**:
-   - Run `createFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes.
-   - Alternatively, run `createOneMinuteTrigger()` for 1-minute updates.
-   - Run `testSync()` to manually verify.
+   - Run `createDocToSheetsFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes.
+   - Alternatively, run `createDocToSheetsOneMinuteTrigger()` for 1-minute updates.
+   - Run `testDocToSheetsSync()` to manually verify.
 
 ### Google Sheet Format
 

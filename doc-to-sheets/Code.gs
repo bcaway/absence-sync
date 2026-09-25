@@ -6,18 +6,12 @@
  * and populates the Google Sheet.
  */
 
-const CONFIG = {
+const DOC_CONFIG = {
   DOC_URL:
     PropertiesService.getScriptProperties().getProperty("DOC_URL")
-
-  SPREADSHEET_ID:
-    PropertiesService.getScriptProperties().getProperty("SPREADSHEET_ID"),
-
-  SHEET_NAME:
-    PropertiesService.getScriptProperties().getProperty("SHEET_NAME"),
 };
 
-const MONTH_MAP = {
+const DOC_MONTH_MAP = {
   january: 1, jan: 1,
   february: 2, feb: 2,
   march: 3, mar: 3,
@@ -34,10 +28,10 @@ const MONTH_MAP = {
 
 
 /**
- * Main sync orchestrator.
+ * Main sync orchestrator for doc-to-sheets.
  */
 function syncDocToSheets() {
-  const url = CONFIG.DOC_URL;
+  const url = DOC_CONFIG.DOC_URL;
   if (!url) {
     throw new Error("DOC_URL is not configured.");
   }
@@ -53,10 +47,10 @@ function syncDocToSheets() {
   const rows = parseDocTable(html);
   console.log(`Parsed ${rows.length} teacher absence row(s).`);
 
-  const sheet = getTargetSheet();
-  writeToSheet(sheet, dateInfo, rows);
+  const sheet = getDocTargetSheet();
+  writeDocDataToSheet(sheet, dateInfo, rows);
 
-  console.log("Sync completed successfully.");
+  console.log("Doc to Sheets sync completed successfully.");
 }
 
 
@@ -178,7 +172,7 @@ function parseDocDate(html) {
   const rawDay = match[2];
   const rawYear = match[3];
 
-  const month = MONTH_MAP[rawMonth];
+  const month = DOC_MONTH_MAP[rawMonth];
   if (!month) {
     throw new Error(`Unrecognized month name: "${match[1]}"`);
   }
@@ -377,29 +371,15 @@ function normalizeHtmlToText(html) {
 
 
 /**
- * Retrieves the target Google Sheet.
+ * Retrieves the target Google Sheet for doc-to-sheets sync.
  */
-function getTargetSheet() {
-  let spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-
-  // If running as a standalone script with SPREADSHEET_ID configured
-  if (!spreadsheet && CONFIG.SPREADSHEET_ID) {
-    spreadsheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  }
+function getDocTargetSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
   if (!spreadsheet) {
     throw new Error(
-      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet, " +
-      "or configure SPREADSHEET_ID in Script Properties."
+      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet."
     );
-  }
-
-  if (CONFIG.SHEET_NAME) {
-    const sheet = spreadsheet.getSheetByName(CONFIG.SHEET_NAME);
-    if (!sheet) {
-      throw new Error(`Sheet tab "${CONFIG.SHEET_NAME}" was not found.`);
-    }
-    return sheet;
   }
 
   return spreadsheet.getActiveSheet() || spreadsheet.getSheets()[0];
@@ -413,7 +393,7 @@ function getTargetSheet() {
  * A1: Date (formatted as M/D/YYYY without leading zeroes, e.g. 9/6/2026)
  * A2:B{N+1}: Teacher and formatted periods
  */
-function writeToSheet(sheet, dateInfo, rows) {
+function writeDocDataToSheet(sheet, dateInfo, rows) {
   // 1. Set A1 date with Date object and format as "m/d/yyyy"
   const cellA1 = sheet.getRange("A1");
   cellA1.setValue(dateInfo.dateObj);
@@ -435,56 +415,56 @@ function writeToSheet(sheet, dateInfo, rows) {
 
 
 /**
- * Creates a recurring 5-minute time-driven trigger.
+ * Creates a recurring 5-minute time-driven trigger for doc-to-sheets.
  * Removes existing triggers for syncDocToSheets first to avoid duplicates.
  */
-function createFiveMinuteTrigger() {
-  createSyncTrigger(5);
+function createDocToSheetsFiveMinuteTrigger() {
+  createDocToSheetsTrigger(5);
 }
 
 
 /**
- * Creates a recurring 1-minute time-driven trigger.
+ * Creates a recurring 1-minute time-driven trigger for doc-to-sheets.
  */
-function createOneMinuteTrigger() {
-  createSyncTrigger(1);
+function createDocToSheetsOneMinuteTrigger() {
+  createDocToSheetsTrigger(1);
 }
 
 
 /**
- * Generic trigger creator for periodic sync.
+ * Generic trigger creator for periodic doc-to-sheets sync.
  *
  * @param {number} minutes Trigger interval in minutes (1, 5, 10, 15, or 30).
  */
-function createSyncTrigger(minutes) {
-  deleteTriggers();
+function createDocToSheetsTrigger(minutes) {
+  deleteDocToSheetsTriggers();
 
   ScriptApp.newTrigger("syncDocToSheets")
     .timeBased()
     .everyMinutes(minutes || 5)
     .create();
 
-  console.log(`Sync trigger created: runs every ${minutes || 5} minute(s).`);
+  console.log(`Doc-to-sheets sync trigger created: runs every ${minutes || 5} minute(s).`);
 }
 
 
 /**
  * Deletes all existing triggers for syncDocToSheets.
  */
-function deleteTriggers() {
+function deleteDocToSheetsTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   for (const trigger of triggers) {
     if (trigger.getHandlerFunction() === "syncDocToSheets") {
       ScriptApp.deleteTrigger(trigger);
     }
   }
-  console.log("Existing sync triggers removed.");
+  console.log("Existing doc-to-sheets sync triggers removed.");
 }
 
 
 /**
- * Manual test function for direct execution in Apps Script editor.
+ * Manual test function for doc-to-sheets execution in Apps Script editor.
  */
-function testSync() {
+function testDocToSheetsSync() {
   syncDocToSheets();
 }
