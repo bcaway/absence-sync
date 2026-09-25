@@ -5,10 +5,15 @@ Automated pipeline syncing BCA teacher attendance and class cancellations from t
 ## Architecture
 
 ```mermaid
-graph LR
-    Doc["Published Google Doc<br/>(Class Cancellation List)"] -->|doc-to-sheets<br/>(Apps Script)| Sheet["Google Sheet<br/>(A1: Date, A: Teacher, B: Periods)"]
-    Sheet -->|sheets-to-supabase<br/>(Apps Script)| Supabase["Supabase Edge Function<br/>(sync-absences)"]
-    Supabase --> DB[("Supabase DB<br/>(teacher_absences)")]
+flowchart LR
+    Doc["Published Google Doc<br/>(Class Cancellation List)"]
+    Sheet["Google Sheet<br/>(A1: Date, A: Teacher, B: Periods)"]
+    Supabase["Supabase Edge Function<br/>(sync-absences)"]
+    DB[("Supabase DB<br/>(teacher_absences)")]
+
+    Doc -->|"doc-to-sheets (Apps Script)"| Sheet
+    Sheet -->|"sheets-to-supabase (Apps Script)"| Supabase
+    Supabase --> DB
 ```
 
 ---
