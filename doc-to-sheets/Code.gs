@@ -61,10 +61,28 @@ function syncDocToSheets() {
  * to a direct public fetch.
  */
 function fetchPublishedDocHtml(url) {
-  let lastError = null;
-
-  // Attempt 1: Fetch with OAuth token (required if published within a Google Workspace domain)
+  // Strategy 1: Direct public fetch
   try {
+    console.log("Attempting direct fetch of published doc URL...");
+    const response = UrlFetchApp.fetch(url, {
+      followRedirects: true,
+      muteHttpExceptions: true,
+    });
+    const status = response.getResponseCode();
+    const text = response.getContentText();
+    console.log(`Direct fetch HTTP ${status}, length: ${text.length}`);
+
+    if (hasDocCancellationContent(text)) {
+      console.log("Cancellation content detected in direct fetch response.");
+      return text;
+    }
+  } catch (e) {
+    console.warn("Direct fetch exception: " + e.message);
+  }
+
+  // Strategy 2: Authenticated fetch with OAuth Bearer token
+  try {
+    console.log("Attempting fetch with OAuth bearer token...");
     const token = ScriptApp.getOAuthToken();
     const responseWithAuth = UrlFetchApp.fetch(url, {
       headers: {
@@ -73,59 +91,110 @@ function fetchPublishedDocHtml(url) {
       followRedirects: true,
       muteHttpExceptions: true,
     });
-
     const status = responseWithAuth.getResponseCode();
     const text = responseWithAuth.getContentText();
+    console.log(`OAuth fetch HTTP ${status}, length: ${text.length}`);
 
-    if (status === 200 && !isLoginOrBlockedPage(text)) {
+    if (hasDocCancellationContent(text)) {
+      console.log("Cancellation content detected in OAuth fetch response.");
       return text;
     }
   } catch (e) {
-    lastError = e;
+    console.warn("OAuth fetch exception: " + e.message);
   }
 
-  // Attempt 2: Direct public fetch (without Authorization header)
+  // Strategy 3: Try with ?embedded=true
   try {
-    const response = UrlFetchApp.fetch(url, {
+    console.log("Attempting fetch with ?embedded=true parameter...");
+    const embedUrl = url.includes("?") ? url + "&embedded=true" : url + "?embedded=true";
+    const embedResponse = UrlFetchApp.fetch(embedUrl, {
       followRedirects: true,
       muteHttpExceptions: true,
     });
+    const status = embedResponse.getResponseCode();
+    const text = embedResponse.getContentText();
+    console.log(`Embedded fetch HTTP ${status}, length: ${text.length}`);
 
-    const status = response.getResponseCode();
-    const text = response.getContentText();
-
-    if (status === 200 && !isLoginOrBlockedPage(text)) {
+    if (hasDocCancellationContent(text)) {
+      console.log("Cancellation content detected in embedded fetch response.");
       return text;
     }
-
-    if (isLoginOrBlockedPage(text)) {
-      throw new Error(
-        "Received Google login redirect. Make sure the executing account has access to the published document."
-      );
-    }
-
-    throw new Error(`HTTP ${status}: ${text.slice(0, 300)}`);
   } catch (e) {
-    lastError = e;
+    console.warn("Embedded fetch exception: " + e.message);
+  }
+
+  // Strategy 4: Fallback to searching Google Drive for the document
+  try {
+    console.log("Searching user's Google Drive for cancellation document...");
+    const driveDocHtml = tryFetchDocFromDrive();
+    if (driveDocHtml) {
+      console.log("Cancellation document found and exported from Google Drive.");
+      return driveDocHtml;
+    }
+  } catch (e) {
+    console.warn("Drive search exception: " + e.message);
   }
 
   throw new Error(
-    "Failed to fetch published document: " + (lastError ? lastError.message : "Unknown error")
+    "Failed to fetch cancellation list content from: " + url + "\n" +
+    "The page returned did not contain the BCA Class Cancellation List or table. " +
+    "If the document is domain-restricted, make sure the executing account has access, " +
+    "or check that the document has been published to the web."
   );
 }
 
 
 /**
- * Checks if the fetched HTML is a Google login wall or access-blocked page.
+ * Checks whether the HTML contains the cancellation document content.
  */
-function isLoginOrBlockedPage(html) {
-  if (!html) return true;
+function hasDocCancellationContent(html) {
+  if (!html) return false;
   return (
-    html.includes("accounts.google.com/ServiceLogin") ||
-    html.includes("Sign in to your Google Account") ||
-    html.includes("class=\"request-storage-access\"") ||
-    html.includes("class=\"document-root loading\"")
+    html.includes("BCA Class Cancellation List") ||
+    (html.includes("Cancellation List") && /<table[^>]*>/i.test(html)) ||
+    (html.includes("Cancellation") && /<table[^>]*>/i.test(html))
   );
+}
+
+
+/**
+ * Fallback to search Drive for files matching "Cancellation" and export HTML.
+ */
+function tryFetchDocFromDrive() {
+  if (typeof DriveApp === "undefined") {
+    return null;
+  }
+
+  const query = "title contains 'Cancellation' and trashed = false";
+  const files = DriveApp.searchFiles(query);
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const fileId = file.getId();
+    console.log(`Found Drive file candidate: "${file.getName()}" (${fileId})`);
+
+    try {
+      const exportUrl = `https://docs.google.com/document/d/${fileId}/export?format=html`;
+      const token = ScriptApp.getOAuthToken();
+      const resp = UrlFetchApp.fetch(exportUrl, {
+        headers: {
+          Authorization: "Bearer " + token,
+        },
+        muteHttpExceptions: true,
+      });
+
+      if (resp.getResponseCode() === 200) {
+        const content = resp.getContentText();
+        if (hasDocCancellationContent(content)) {
+          return content;
+        }
+      }
+    } catch (err) {
+      console.warn(`Could not export file ${fileId}: ${err.message}`);
+    }
+  }
+
+  return null;
 }
 
 
