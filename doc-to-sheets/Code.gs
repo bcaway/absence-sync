@@ -664,13 +664,20 @@ function doPost(e) {
     }
 
     let syncMessage = "Cookie successfully updated.";
+    const cachedHtml = scriptProps.getProperty("LAST_VALID_HTML");
     if (payload.triggerSync === true || payload.triggerSync === "true") {
-      try {
-        syncDocToSheets();
-        syncMessage = "Cookie updated and sync executed successfully.";
-      } catch (syncErr) {
-        console.error("Immediate sync error after cookie update: " + syncErr.message);
-        syncMessage = "Cookie updated, but sync execution failed: " + syncErr.message;
+      if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
+        try {
+          const dateInfo = parseDocDate(cachedHtml);
+          const rows = parseDocTable(cachedHtml);
+          const sheet = getDocTargetSheet();
+          writeDocDataToSheet(sheet, dateInfo, rows);
+          syncMessage = `Cookie updated and staged ${rows.length} absence(s) from document cache.`;
+        } catch (cacheErr) {
+          console.warn("Cached HTML staging error: " + cacheErr.message);
+        }
+      } else {
+        syncMessage = "Cookie successfully synchronized. Keep the cancellation document open in Chrome for instant table sync.";
       }
     }
 
