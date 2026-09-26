@@ -32,7 +32,7 @@ See [chrome-cookie-tool README](../../chrome-cookie-tool/README.md) for extensio
 
 ## 1. doc-to-sheets
 
-Google Apps Script that fetches the published BCA Class Cancellation List document, parses the date and teacher absences table, and populates the Google Sheet.
+Google Apps Script deployed as a Web App that receives session cookies from `chrome-cookie-tool`, fetches the published BCA Class Cancellation List document, parses the date and teacher absences table, and populates the Google Sheet.
 
 ### Setup Instructions
 
@@ -40,13 +40,15 @@ Google Apps Script that fetches the published BCA Class Cancellation List docume
 2. Click **Extensions** > **Apps Script**.
 3. Copy the contents of [`doc-to-sheets/Code.gs`](./doc-to-sheets/Code.gs) into `Code.gs`.
 4. (Optional) If editing the manifest, enable "Show appsscript.json manifest file in editor" under Project Settings and copy [`doc-to-sheets/appsscript.json`](./doc-to-sheets/appsscript.json).
-5. **Script Properties** (optional):
-   - `DOC_URL`: The published doc URL (defaults to the BCA cancellation list `/pub` URL).
-   - `DOC_COOKIE`: Session cookie string from your browser (required if the published doc has "Require viewers to sign in" enabled).
+5. **Deploy as Web App**:
+   - Click **Deploy** > **New deployment** > Select type: **Web app**.
+   - **Execute as**: `Me`
+   - **Who has access**: `Anyone`
+   - Click **Deploy** and copy the **Web app URL** into the Chrome extension settings.
 6. **Automation**:
-   - Run `createDocToSheetsFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes.
+   - Run `createDocToSheetsFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes in Google's cloud using the fresh cookie.
    - Alternatively, run `createDocToSheetsOneMinuteTrigger()` for 1-minute updates.
-   - Run `testDocToSheetsSync()` to manually verify.
+   - Run `testDocToSheetsSync()` to manually test.
 
 ### Google Sheet Format
 

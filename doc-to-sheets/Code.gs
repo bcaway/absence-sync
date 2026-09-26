@@ -1,24 +1,17 @@
 /**
  * BCA Class Cancellation List to Google Sheets Sync
  *
- * Fetches the published BCA Class Cancellation Google Doc, extracts the
- * date and teacher cancellations table, formats according to specified rules,
- * and populates the Google Sheet.
+ * Fetches the domain-restricted published BCA Class Cancellation Google Doc
+ * using active session credentials synchronized by the BCA Absence Sync Chrome Extension.
+ * Formats the cancellation table and stages data in Google Sheets for downstream sync.
  */
 
 const DOC_CONFIG = {
-  get DOC_URL() {
-    return (
-      PropertiesService.getScriptProperties().getProperty("DOC_URL")
-    );
-  },
+  DOC_URL:
+    PropertiesService.getScriptProperties().getProperty("DOC_URL") ||
+    "https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub",
 
-  // Optional: If the original Google Doc ID is known and accessible
-  get DOC_ID() {
-    return PropertiesService.getScriptProperties().getProperty("DOC_ID");
-  },
-
-  // Optional: Browser session cookie if published doc is domain-restricted
+  // Cookie synchronized automatically from the Chrome Extension
   get DOC_COOKIE() {
     return PropertiesService.getScriptProperties().getProperty("DOC_COOKIE");
   },
@@ -42,35 +35,21 @@ const DOC_MONTH_MAP = {
 
 /**
  * Main sync orchestrator for doc-to-sheets.
+ * Fetches published doc HTML with the extension's session cookie, parses data, and writes to Sheets.
  */
 function syncDocToSheets() {
-  let dateInfo;
-  let rows;
+  const url = DOC_CONFIG.DOC_URL;
+  console.log("Starting BCA absence sync from: " + url);
 
-  // Path A: Direct DocumentApp access if DOC_ID is configured
-  if (DOC_CONFIG.DOC_ID) {
-    console.log("Using DocumentApp with DOC_ID: " + DOC_CONFIG.DOC_ID);
-    const docData = readFromDocumentApp(DOC_CONFIG.DOC_ID);
-    dateInfo = docData.dateInfo;
-    rows = docData.rows;
-  } else {
-    // Path B: Fetch published web document
-    const url = DOC_CONFIG.DOC_URL;
-    if (!url) {
-      throw new Error("DOC_URL is not configured.");
-    }
+  const html = fetchPublishedDocHtml(url);
 
-    console.log("Fetching published doc from: " + url);
-    const html = fetchPublishedDocHtml(url);
+  console.log("Parsing document date...");
+  const dateInfo = parseDocDate(html);
+  console.log("Parsed date: " + dateInfo.formattedDate);
 
-    console.log("Parsing document date...");
-    dateInfo = parseDocDate(html);
-    console.log("Parsed date: " + dateInfo.formattedDate);
-
-    console.log("Parsing cancellation table...");
-    rows = parseDocTable(html);
-    console.log(`Parsed ${rows.length} teacher absence row(s).`);
-  }
+  console.log("Parsing cancellation table...");
+  const rows = parseDocTable(html);
+  console.log(`Parsed ${rows.length} teacher absence row(s).`);
 
   const sheet = getDocTargetSheet();
   writeDocDataToSheet(sheet, dateInfo, rows);
@@ -80,157 +59,55 @@ function syncDocToSheets() {
 
 
 /**
- * Reads directly from Google Docs if DOC_ID is provided.
- */
-function readFromDocumentApp(docId) {
-  const doc = DocumentApp.openById(docId);
-  const body = doc.getBody();
-  const text = body.getText();
-  const dateInfo = parseDocDate(text);
-
-  const tables = body.getTables();
-  if (tables.length === 0) {
-    throw new Error("No table found in Google Document.");
-  }
-
-  const table = tables[0];
-  const numRows = table.getNumRows();
-  const rows = [];
-
-  for (let i = 1; i < numRows; i++) {
-    const tableRow = table.getRow(i);
-    const teacher = tableRow.getCell(0).getText().trim();
-    const rawCol2 = tableRow.getCell(1).getText().trim();
-
-    if (!teacher && !rawCol2) {
-      continue;
-    }
-
-    const formattedPeriods = parsePeriodsCell(rawCol2);
-    rows.push([teacher, formattedPeriods]);
-  }
-
-  return { dateInfo, rows };
-}
-
-
-/**
- * Fetches published Google Doc HTML.
+ * Fetches published Google Doc HTML using the session cookie provided by the Chrome extension.
+ *
+ * @param {string} url Published doc URL.
+ * @return {string} Document HTML content.
  */
 function fetchPublishedDocHtml(url) {
-  // Strategy 0: If DOC_COOKIE is configured in Script Properties
-  if (DOC_CONFIG.DOC_COOKIE) {
-    try {
-      console.log("Attempting fetch with provided DOC_COOKIE...");
-      const cleanCookie = DOC_CONFIG.DOC_COOKIE.replace(/^Cookie:\s*/i, "").trim();
-      const response = UrlFetchApp.fetch(url, {
-        headers: {
-          Cookie: cleanCookie,
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-        followRedirects: true,
-        muteHttpExceptions: true,
-      });
-      const status = response.getResponseCode();
-      const text = response.getContentText();
-      console.log(`Cookie fetch HTTP ${status}, length: ${text.length}`);
+  const cookie = DOC_CONFIG.DOC_COOKIE;
 
-      if (hasDocCancellationContent(text)) {
-        console.log("Cancellation content detected with session cookie.");
-        return text;
-      } else {
-        console.warn(`Cookie fetch did not return cancellation content. HTTP ${status}, preview: ${text.slice(0, 150)}`);
-      }
-    } catch (e) {
-      console.warn("Cookie fetch exception: " + e.message);
-    }
+  if (!cookie || !cookie.trim()) {
+    throw new Error(
+      "Missing DOC_COOKIE in Script Properties.\n\n" +
+      "The BCA Class Cancellation document requires domain authentication.\n" +
+      "Please open the BCA Absence Sync Chrome extension and click 'Sync Cookie Now' to connect your session."
+    );
   }
 
-  // Strategy 1: Direct public fetch
-  try {
-    console.log("Attempting direct fetch of published doc URL...");
-    const response = UrlFetchApp.fetch(url, {
-      followRedirects: true,
-      muteHttpExceptions: true,
-    });
-    const status = response.getResponseCode();
-    const text = response.getContentText();
-    console.log(`Direct fetch HTTP ${status}, length: ${text.length}`);
+  const cleanCookie = cookie.replace(/^Cookie:\s*/i, "").trim();
 
-    if (hasDocCancellationContent(text)) {
-      console.log("Cancellation content detected in direct fetch response.");
-      return text;
-    }
-  } catch (e) {
-    console.warn("Direct fetch exception: " + e.message);
+  console.log("Fetching cancellation doc with session cookie from Chrome extension...");
+  const response = UrlFetchApp.fetch(url, {
+    headers: {
+      Cookie: cleanCookie,
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    followRedirects: true,
+    muteHttpExceptions: true,
+  });
+
+  const status = response.getResponseCode();
+  const text = response.getContentText();
+  console.log(`Doc fetch response HTTP ${status}, length: ${text.length}`);
+
+  if (status === 200 && hasDocCancellationContent(text)) {
+    return text;
   }
 
-  // Strategy 2: Authenticated fetch with OAuth Bearer token
-  try {
-    console.log("Attempting fetch with OAuth bearer token...");
-    const token = ScriptApp.getOAuthToken();
-    const responseWithAuth = UrlFetchApp.fetch(url, {
-      headers: {
-        Authorization: "Bearer " + token,
-      },
-      followRedirects: true,
-      muteHttpExceptions: true,
-    });
-    const status = responseWithAuth.getResponseCode();
-    const text = responseWithAuth.getContentText();
-    console.log(`OAuth fetch HTTP ${status}, length: ${text.length}`);
-
-    if (hasDocCancellationContent(text)) {
-      console.log("Cancellation content detected in OAuth fetch response.");
-      return text;
-    }
-  } catch (e) {
-    console.warn("OAuth fetch exception: " + e.message);
+  if (status === 401 || status === 403 || !hasDocCancellationContent(text)) {
+    throw new Error(
+      `Failed to access BCA Class Cancellation List (HTTP ${status}).\n\n` +
+      "The session cookie from the Chrome extension has expired or is invalid.\n" +
+      "Please open Chrome and click 'Sync Cookie Now' in the extension to refresh your credentials."
+    );
   }
 
-  // Strategy 3: Try with ?embedded=true
-  try {
-    console.log("Attempting fetch with ?embedded=true parameter...");
-    const embedUrl = url.includes("?") ? url + "&embedded=true" : url + "?embedded=true";
-    const embedResponse = UrlFetchApp.fetch(embedUrl, {
-      followRedirects: true,
-      muteHttpExceptions: true,
-    });
-    const status = embedResponse.getResponseCode();
-    const text = embedResponse.getContentText();
-    console.log(`Embedded fetch HTTP ${status}, length: ${text.length}`);
-
-    if (hasDocCancellationContent(text)) {
-      console.log("Cancellation content detected in embedded fetch response.");
-      return text;
-    }
-  } catch (e) {
-    console.warn("Embedded fetch exception: " + e.message);
-  }
-
-  // Strategy 4: Fallback to searching Google Drive for the document
-  try {
-    console.log("Searching user's Google Drive for cancellation document...");
-    const driveDocHtml = tryFetchDocFromDrive();
-    if (driveDocHtml) {
-      console.log("Cancellation document found and exported from Google Drive.");
-      return driveDocHtml;
-    }
-  } catch (e) {
-    console.warn("Drive search exception: " + e.message);
-  }
-
-  throw new Error(
-    "Failed to fetch cancellation list content from: " + url + "\n\n" +
-    "Google returned HTTP 401/403 because the document was published with 'Require viewers to sign in with their domain account' enabled.\n" +
-    "Server-side scripts cannot perform interactive Google logins without session cookies.\n\n" +
-    "To resolve this, choose one of the following options:\n" +
-    "1. (Recommended) In the Google Doc, go to File > Share > Publish to web, expand 'Published content & settings', and uncheck 'Require viewers to sign in'.\n" +
-    "2. If you have the standard Google Doc ID, set DOC_ID in Script Properties.\n" +
-    "3. Set DOC_COOKIE in Script Properties with your browser session cookie from viewing the page."
-  );
+  return text;
 }
 
 
@@ -247,46 +124,6 @@ function hasDocCancellationContent(html) {
   );
 }
 
-
-/**
- * Fallback to search Drive for files matching "Cancellation" and export HTML.
- */
-function tryFetchDocFromDrive() {
-  if (typeof DriveApp === "undefined") {
-    return null;
-  }
-
-  const query = "title contains 'Cancellation' and trashed = false";
-  const files = DriveApp.searchFiles(query);
-
-  while (files.hasNext()) {
-    const file = files.next();
-    const fileId = file.getId();
-    console.log(`Found Drive file candidate: "${file.getName()}" (${fileId})`);
-
-    try {
-      const exportUrl = `https://docs.google.com/document/d/${fileId}/export?format=html`;
-      const token = ScriptApp.getOAuthToken();
-      const resp = UrlFetchApp.fetch(exportUrl, {
-        headers: {
-          Authorization: "Bearer " + token,
-        },
-        muteHttpExceptions: true,
-      });
-
-      if (resp.getResponseCode() === 200) {
-        const content = resp.getContentText();
-        if (hasDocCancellationContent(content)) {
-          return content;
-        }
-      }
-    } catch (err) {
-      console.warn(`Could not export file ${fileId}: ${err.message}`);
-    }
-  }
-
-  return null;
-}
 
 
 /**
