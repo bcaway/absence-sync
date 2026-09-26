@@ -389,6 +389,16 @@ function writeDocDataToSheet(sheet, dateInfo, rows) {
   }
 
   SpreadsheetApp.flush();
+
+  // If sheets-to-supabase is in the same Apps Script project, chain sync immediately
+  if (typeof syncAbsences === "function") {
+    console.log("Triggering sheets-to-supabase sync...");
+    try {
+      syncAbsences();
+    } catch (err) {
+      console.warn("sheets-to-supabase sync notice: " + err.message);
+    }
+  }
 }
 
 

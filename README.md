@@ -53,17 +53,27 @@ Natively reads the BCA Class Cancellation Google Doc using Google Apps Script's 
 
 ---
 
-## 2. sheets-to-supabase
+## 2. sheets-to-supabase (Real-Time Event-Driven)
 
-Google Apps Script bound to the Google Sheet that reads the staged date and teacher absences, validates the data, and sends it to the Supabase Edge Function.
+Google Apps Script bound to the Google Sheet that watches for changes, validates the staged absences data, and pushes updates directly to the Supabase Edge Function.
+
+**Key Features**:
+- **Event-Driven Execution**: Runs immediately whenever an edit or structural change is made in the Google Sheet (via an installable `onChange` trigger).
+- **Content Fingerprinting (MD5 Hashing)**: Computes a snapshot hash before calling Supabase. If an edit didn't change the parsed absence records (or if someone only clicked around/reformatted), it skips the network call to avoid unnecessary traffic.
+- **Immediate Chaining with doc-to-sheets**: When placed in the same Google Sheet Apps Script project, `doc-to-sheets` automatically chains into `syncAbsences()` upon writing to the sheet, providing zero-latency end-to-end sync.
+- **Concurrency Locking**: Uses Google Apps Script's `LockService` to prevent race conditions during rapid consecutive edits.
 
 ### Setup Instructions
 
 1. In the same (or bound) Google Apps Script project, configure Script Properties:
    - `SUPABASE_URL`: Your Supabase project URL (e.g. `https://xyz.supabase.co`).
    - `SYNC_SECRET`: Bearer authentication secret matching your Supabase environment.
-2. Run `createFiveMinuteTrigger()` to automate sync to Supabase.
-3. Run `testSync()` to manually execute.
+   - `SHEET_NAME` *(optional)*: Specific sheet tab name if your workbook has multiple tabs.
+2. In the Apps Script toolbar, select function `createSheetChangeTrigger` and click **Run**.
+   - This sets up the installable `onChange` trigger and cleans up any old triggers.
+3. Test your connection:
+   - Run `testSync()` (or `forceSyncAbsences()`) to perform a forced sync and verify the response from Supabase.
+   - Edit a cell in the sheet and check **Executions** in Apps Script to see the real-time trigger in action!
 
 ---
 

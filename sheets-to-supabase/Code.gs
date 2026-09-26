@@ -1,66 +1,157 @@
-const CONFIG = {
-  SUPABASE_URL: PropertiesService
-    .getScriptProperties()
-    .getProperty("SUPABASE_URL"),
+/**
+ * BCA Google Sheets to Supabase Sync (Event-Driven)
+ *
+ * Reads staged absence data from Google Sheets, normalizes the payload,
+ * detects changes using content fingerprinting (MD5 hash), and synchronizes
+ * directly with the Supabase sync-absences Edge Function.
+ *
+ * Automatically triggered on every change in the Google Sheet using an
+ * installable onChange trigger (zero polling latency, zero redundant API calls).
+ */
 
-  SYNC_SECRET: PropertiesService
-    .getScriptProperties()
-    .getProperty("SYNC_SECRET"),
+const CONFIG = {
+  get SUPABASE_URL() {
+    return PropertiesService.getScriptProperties().getProperty("SUPABASE_URL");
+  },
+
+  get SYNC_SECRET() {
+    return PropertiesService.getScriptProperties().getProperty("SYNC_SECRET");
+  },
+
+  get SHEET_NAME() {
+    return PropertiesService.getScriptProperties().getProperty("SHEET_NAME");
+  },
 };
 
 
 /**
- * Main sync function.
+ * Event handler executed automatically whenever a change occurs in the Google Sheet.
  *
- * Google Sheet format:
+ * Configured via createSheetChangeTrigger().
  *
- * A1: Date
- *
- * A2: Teacher
- * B2: Periods
- *
- * A3: Teacher
- * B3: Periods
- *
- * Example:
- *
- * A1 = 9/20/2026
- *
- * A2 = Bian
- * B2 = all
- *
- * A3 = Xu
- * B3 = 1-3, 7-8, 5, igs
+ * @param {Object} [e] Google Apps Script change event object.
  */
-function syncAbsences() {
-  if (!CONFIG.SUPABASE_URL) {
-    throw new Error("SUPABASE_URL is not configured.");
-  }
-
-  if (!CONFIG.SYNC_SECRET) {
-    throw new Error("SYNC_SECRET is not configured.");
-  }
-
-  const data = readSheet();
-
-  sendToSupabase(data);
+function handleChange(e) {
+  const changeType = e && e.changeType ? e.changeType : "CHANGE";
+  console.log(`Detected spreadsheet change event: ${changeType}`);
+  syncAbsences({ changeType: changeType });
 }
 
 
 /**
- * Reads and parses the active Google Sheet.
+ * Main sync function.
+ * Reads the sheet, checks if the data changed since last sync, and pushes to Supabase.
+ *
+ * Google Sheet format:
+ * A1: Date (e.g. 9/20/2026 or Date object)
+ * A2: Teacher (e.g. Bian)
+ * B2: Periods (e.g. all, or 1-3, 7-8, 5, igs)
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.force=false] If true, bypasses the hash check and forces sync.
+ * @param {string} [options.changeType] Description of the trigger event type.
  */
-function readSheet() {
+function syncAbsences(options) {
+  options = options || {};
+  const force = Boolean(options.force);
+
+  if (!CONFIG.SUPABASE_URL) {
+    throw new Error(
+      "SUPABASE_URL is not configured. Please set 'SUPABASE_URL' in Project Settings > Script Properties."
+    );
+  }
+
+  if (!CONFIG.SYNC_SECRET) {
+    throw new Error(
+      "SYNC_SECRET is not configured. Please set 'SYNC_SECRET' in Project Settings > Script Properties."
+    );
+  }
+
+  // Prevent concurrent executions if multiple rapid edits occur
+  const lock = LockService.getScriptLock();
+  const hasLock = lock.tryLock(15000);
+  if (!hasLock) {
+    console.warn("Could not acquire script lock: another sync is already in progress.");
+    return { skipped: true, reason: "locked" };
+  }
+
+  try {
+    const data = readSheet();
+    const currentHash = computeDataHash(data);
+    const props = PropertiesService.getScriptProperties();
+    const lastHash = props.getProperty("LAST_SYNCED_HASH");
+
+    if (!force && lastHash === currentHash) {
+      console.log(
+        `No change detected in absences table since last sync (hash: ${currentHash}). Skipping Supabase sync.`
+      );
+      return { skipped: true, hash: currentHash };
+    }
+
+    console.log(
+      `Detected change in absences table (old hash: ${lastHash || "none"}, new hash: ${currentHash}). ` +
+      `Syncing ${data.absences.length} record(s) for ${data.date} to Supabase...`
+    );
+
+    const response = sendToSupabase(data);
+
+    props.setProperty("LAST_SYNCED_HASH", currentHash);
+    props.setProperty("LAST_SYNCED_AT", new Date().toISOString());
+
+    console.log(`Supabase sync completed successfully (hash: ${currentHash}).`);
+    return { skipped: false, hash: currentHash, response: response };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * Computes a deterministic MD5 hash for the sheet absence data snapshot.
+ * Used to avoid redundant HTTP requests when the sheet contents have not changed.
+ *
+ * @param {Object} data Parsed sheet data.
+ * @returns {string} Base64-encoded MD5 hash string.
+ */
+function computeDataHash(data) {
+  const content = JSON.stringify(data);
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.MD5,
+    content,
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64Encode(digest);
+}
+
+
+/**
+ * Gets the active or configured target sheet.
+ */
+function getTargetSheet() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
   if (!spreadsheet) {
     throw new Error(
-      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet."
+      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet (Extensions > Apps Script)."
     );
   }
 
-  const sheet = spreadsheet.getActiveSheet();
+  const configuredName = CONFIG.SHEET_NAME;
+  if (configuredName) {
+    const found = spreadsheet.getSheetByName(configuredName);
+    if (found) return found;
+    console.warn(`Configured SHEET_NAME "${configuredName}" not found; falling back to active sheet.`);
+  }
 
+  return spreadsheet.getActiveSheet() || spreadsheet.getSheets()[0];
+}
+
+
+/**
+ * Reads and parses the Google Sheet.
+ */
+function readSheet() {
+  const sheet = getTargetSheet();
   const lastRow = sheet.getLastRow();
 
   if (lastRow < 1) {
@@ -71,14 +162,11 @@ function readSheet() {
    * A1 must contain the date.
    */
   const dateValue = sheet.getRange("A1").getValue();
-
   const date = parseSheetDate(dateValue);
 
   /*
    * There are no teacher rows.
-   *
-   * We still return the date. The Supabase function can decide
-   * how to handle an empty snapshot.
+   * Return empty absences snapshot.
    */
   if (lastRow < 2) {
     return {
@@ -131,7 +219,7 @@ function readSheet() {
   }
 
   /*
-   * Sort teachers here so the payload is deterministic.
+   * Sort teachers here so the payload is deterministic for hashing.
    */
   absences.sort((a, b) =>
     a.teacher.localeCompare(b.teacher)
@@ -145,21 +233,48 @@ function readSheet() {
 
 
 /**
- * Parses a Google Sheets date value into:
- *
+ * Parses a Google Sheets date value (Date object or text string) into:
  * yyyy-MM-dd
  */
 function parseSheetDate(value) {
-  if (!(value instanceof Date) || isNaN(value.getTime())) {
-    throw new Error(
-      "Cell A1 must contain a valid date."
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return Utilities.formatDate(
+      value,
+      Session.getScriptTimeZone(),
+      "yyyy-MM-dd"
     );
   }
 
-  return Utilities.formatDate(
-    value,
-    Session.getScriptTimeZone(),
-    "yyyy-MM-dd"
+  if (typeof value === "string" && value.trim()) {
+    const trimmed = value.trim();
+
+    // Standard yyyy-MM-dd
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    // M/D/YYYY or MM/DD/YYYY
+    const slashMatch = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (slashMatch) {
+      const month = slashMatch[1].padStart(2, "0");
+      const day = slashMatch[2].padStart(2, "0");
+      const year = slashMatch[3];
+      return `${year}-${month}-${day}`;
+    }
+
+    // Fallback: new Date(trimmed)
+    const parsed = new Date(trimmed);
+    if (!isNaN(parsed.getTime())) {
+      return Utilities.formatDate(
+        parsed,
+        Session.getScriptTimeZone(),
+        "yyyy-MM-dd"
+      );
+    }
+  }
+
+  throw new Error(
+    "Cell A1 must contain a valid date (e.g. 9/20/2026 or Date object). Received: " + value
   );
 }
 
@@ -168,22 +283,11 @@ function parseSheetDate(value) {
  * Parses the raw periods string.
  *
  * Rules:
- *
- * all
- *   -> igs, 1, 2, 3, 4, 5, 6, 7, 8, 9
- *
- * igs
- *   -> igs
- *
- * 2
- *   -> 2
- *
- * 1-3
- *   -> 1, 2, 3
- *
- * Invalid values are ignored.
- *
- * Duplicate periods are automatically removed.
+ * - "all" / "all day" -> "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9"
+ * - "igs" -> "igs"
+ * - 2 -> "2"
+ * - 1-3 -> "1, 2, 3"
+ * - Duplicate periods are automatically removed.
  */
 function parsePeriods(rawValue) {
   const tokens = String(rawValue)
@@ -191,16 +295,13 @@ function parsePeriods(rawValue) {
     .map((token) => token.trim().toLowerCase())
     .filter((token) => token.length > 0);
 
+  if (tokens.some((token) => token === "all" || token === "all day")) {
+    return "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9";
+  }
+
   const periods = new Set();
 
   for (const token of tokens) {
-    /*
-     * "all" always wins.
-     */
-    if (token === "all") {
-      return "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9";
-    }
-
     /*
      * IGS.
      */
@@ -211,7 +312,6 @@ function parsePeriods(rawValue) {
 
     /*
      * Single numerical period.
-     *
      * Only 1 through 9 are valid.
      */
     if (/^\d+$/.test(token)) {
@@ -226,10 +326,7 @@ function parsePeriods(rawValue) {
 
     /*
      * Numerical range.
-     *
-     * Examples:
-     * 1-3
-     * 2-9
+     * Examples: 1-3, 2-9
      */
     const rangeMatch = token.match(/^(\d+)\s*-\s*(\d+)$/);
 
@@ -237,9 +334,6 @@ function parsePeriods(rawValue) {
       const start = Number(rangeMatch[1]);
       const end = Number(rangeMatch[2]);
 
-      /*
-       * Invalid ranges are ignored.
-       */
       if (
         start >= 1 &&
         start <= 9 &&
@@ -254,10 +348,6 @@ function parsePeriods(rawValue) {
 
       continue;
     }
-
-    /*
-     * Anything else is intentionally ignored.
-     */
   }
 
   if (periods.size === 0) {
@@ -288,21 +378,16 @@ function parsePeriods(rawValue) {
  * Sends the normalized snapshot to Supabase.
  */
 function sendToSupabase(data) {
-  const endpoint =
-    CONFIG.SUPABASE_URL +
-    "/functions/v1/sync-absences";
+  const baseUrl = (CONFIG.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  const endpoint = baseUrl + "/functions/v1/sync-absences";
 
   const response = UrlFetchApp.fetch(endpoint, {
     method: "post",
-
     contentType: "application/json",
-
     headers: {
       Authorization: "Bearer " + CONFIG.SYNC_SECRET,
     },
-
     payload: JSON.stringify(data),
-
     muteHttpExceptions: true,
   });
 
@@ -318,36 +403,82 @@ function sendToSupabase(data) {
     );
   }
 
-  console.log(responseBody);
+  console.log("Supabase response:", responseBody);
+  return responseBody;
 }
 
 
 /**
- * Creates the five-minute trigger.
+ * Creates the installable onChange trigger.
  *
- * Deletes existing sync triggers first so running this
- * function multiple times does not create duplicates.
+ * Removes any existing triggers first so running this function multiple
+ * times does not create duplicates.
  */
-function createFiveMinuteTrigger() {
-  const triggers = ScriptApp.getProjectTriggers();
+function createSheetChangeTrigger() {
+  deleteTriggers();
 
-  for (const trigger of triggers) {
-    if (
-      trigger.getHandlerFunction() === "syncAbsences"
-    ) {
-      ScriptApp.deleteTrigger(trigger);
-    }
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  if (!spreadsheet) {
+    throw new Error(
+      "No active spreadsheet found. Open the Google Sheet and open Apps Script from Extensions > Apps Script."
+    );
   }
 
-  ScriptApp
-    .newTrigger("syncAbsences")
-    .timeBased()
-    .everyMinutes(5)
+  ScriptApp.newTrigger("handleChange")
+    .forSpreadsheet(spreadsheet)
+    .onChange()
     .create();
 
   console.log(
-    "Five-minute sync trigger created."
+    "Installable sheet change trigger created successfully! " +
+    "Every edit, addition, or deletion in the Google Sheet will now trigger sync to Supabase."
   );
+}
+
+
+/**
+ * Removes existing triggers associated with this sync script.
+ */
+function deleteTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  let count = 0;
+
+  for (const trigger of triggers) {
+    const handler = trigger.getHandlerFunction();
+    if (
+      handler === "handleChange" ||
+      handler === "syncAbsences" ||
+      handler === "onSheetChange"
+    ) {
+      ScriptApp.deleteTrigger(trigger);
+      count++;
+    }
+  }
+
+  console.log(`Removed ${count} existing trigger(s).`);
+}
+
+
+/**
+ * Lists all active project triggers for inspection.
+ */
+function listTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  console.log(`Active triggers for this project (${triggers.length}):`);
+  for (const trigger of triggers) {
+    console.log(
+      `- Handler: ${trigger.getHandlerFunction()} | Type: ${trigger.getEventType()} | ID: ${trigger.getUniqueId()}`
+    );
+  }
+}
+
+
+/**
+ * Forces a manual sync to Supabase, bypassing the change hash check.
+ */
+function forceSyncAbsences() {
+  console.log("Starting forced manual sync to Supabase...");
+  return syncAbsences({ force: true });
 }
 
 
@@ -355,5 +486,15 @@ function createFiveMinuteTrigger() {
  * Manually test the entire sync process.
  */
 function testSync() {
-  syncAbsences();
+  return forceSyncAbsences();
+}
+
+
+/**
+ * @deprecated Legacy function kept for backward compatibility.
+ * Replaced by createSheetChangeTrigger().
+ */
+function createFiveMinuteTrigger() {
+  console.warn("createFiveMinuteTrigger is deprecated. Creating real-time sheet change trigger instead...");
+  createSheetChangeTrigger();
 }
