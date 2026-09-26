@@ -1,22 +1,19 @@
 /**
- * BCA Class Cancellation List to Google Sheets Sync
+ * BCA Class Cancellation List to Google Sheets Sync (Native Google Workspace)
  *
- * Fetches the domain-restricted published BCA Class Cancellation Google Doc
- * using active session credentials synchronized by the BCA Absence Sync Chrome Extension.
- * Formats the cancellation table and stages data in Google Sheets for downstream sync.
+ * Reads the BCA Class Cancellation Google Doc natively using DocumentApp,
+ * parses the date and teacher absences table, and stages formatted data in Google Sheets.
+ *
+ * Runs autonomously 24/7 via Apps Script time-driven triggers with zero cookies,
+ * zero HTTP requests, and zero browser extensions required.
  */
 
 const DOC_CONFIG = {
-  DOC_URL:
-    PropertiesService.getScriptProperties().getProperty("DOC_URL") ||
-    "https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub",
-
-  AUTH_USER:
-    PropertiesService.getScriptProperties().getProperty("AUTH_USER") || "kabsek30@bergen.org",
-
-  // Cookie synchronized automatically from the Chrome Extension
-  get DOC_COOKIE() {
-    return PropertiesService.getScriptProperties().getProperty("DOC_COOKIE");
+  // Google Drive File ID or full URL of the BCA Class Cancellation document.
+  // Set in Script Properties under 'DOC_ID', or paste directly below:
+  get DOC_ID() {
+    const raw = PropertiesService.getScriptProperties().getProperty("DOC_ID") || "";
+    return extractDocId(raw);
   },
 };
 
@@ -38,218 +35,170 @@ const DOC_MONTH_MAP = {
 
 /**
  * Main sync orchestrator for doc-to-sheets.
- * Fetches published doc HTML with the extension's session cookie, parses data, and writes to Sheets.
+ * Natively opens the cancellation doc, parses the date and absences table, and populates the Sheet.
  */
 function syncDocToSheets() {
-  const url = DOC_CONFIG.DOC_URL;
-  console.log("Starting BCA absence sync from: " + url);
+  const docId = DOC_CONFIG.DOC_ID;
 
-  const html = fetchPublishedDocHtml(url);
+  if (!docId) {
+    throw new Error(
+      "Missing DOC_ID in Script Properties.\n\n" +
+      "Please set 'DOC_ID' in Project Settings > Script Properties (or run searchDriveForCancellationDoc() to find it).\n" +
+      "You can provide either the 44-character document ID or the full Google Docs URL."
+    );
+  }
+
+  console.log("Opening BCA Class Cancellation document (ID: " + docId + ")...");
+  const doc = DocumentApp.openById(docId);
+  const body = doc.getBody();
 
   console.log("Parsing document date...");
-  const dateInfo = parseDocDate(html);
-  console.log("Parsed date: " + dateInfo.formattedDate);
+  const fullText = body.getText();
+  const dateInfo = parseDocDate(fullText);
+  console.log(`Parsed date: ${dateInfo.formattedDate} (${dateInfo.year}-${dateInfo.month}-${dateInfo.day})`);
 
   console.log("Parsing cancellation table...");
-  const rows = parseDocTable(html);
+  const rows = parseDocTables(doc);
   console.log(`Parsed ${rows.length} teacher absence row(s).`);
 
   const sheet = getDocTargetSheet();
   writeDocDataToSheet(sheet, dateInfo, rows);
 
-  console.log("Doc to Sheets sync completed successfully.");
+  console.log(`Doc to Sheets sync completed successfully. Staged ${rows.length} absence(s) for ${dateInfo.formattedDate}.`);
 }
 
 
 /**
- * Fetches published Google Doc HTML using the session cookie provided by the Chrome extension.
- *
- * @param {string} url Published doc URL.
- * @return {string} Document HTML content.
+ * Manual test function for doc-to-sheets execution in Apps Script editor.
  */
-function fetchPublishedDocHtml(url) {
-  const cookie = DOC_CONFIG.DOC_COOKIE;
+function testDocToSheetsSync() {
+  console.log("Starting manual test of BCA Doc to Sheets sync...");
+  syncDocToSheets();
+}
 
-  if (!cookie || !cookie.trim()) {
-    // Check if we have valid HTML synchronized directly from the Chrome extension
-    const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
-    if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
-      console.log("No DOC_COOKIE found, but using latest HTML synchronized directly from Chrome extension.");
-      return cachedHtml;
-    }
 
-    throw new Error(
-      "Missing DOC_COOKIE in Script Properties.\n\n" +
-      "The BCA Class Cancellation document requires domain authentication.\n" +
-      "Please open the BCA Absence Sync Chrome extension and click 'Sync Cookie Now' to connect your session."
-    );
-  }
+/**
+ * Helper utility to search your Google Drive for the BCA Class Cancellation document.
+ * Run this function in the Apps Script editor to discover the Document ID if you don't know it!
+ */
+function searchDriveForCancellationDoc() {
+  console.log("Searching Google Drive for BCA cancellation documents...");
 
-  const cleanCookie = cookie.replace(/^Cookie:\s*/i, "").trim();
-
-  // Filter out known problematic cookies that cause Google to redirect to Account Chooser
-  const disallowedCookies = [
-    "ACCOUNT_CHOOSER",
-    "PLAY_ACTIVE_ACCOUNT",
-    "GG_ACTIVE_ACCOUNT",
-    "GG_XSRF",
-    "GMAIL_AT",
-    "__Host-GAPS",
-    "LSID",
-    "__Host-1PLSID",
-    "__Host-3PLSID",
-    "LSOLH",
-    "SNID",
-    "SMSV",
-    "COMPASS",
+  const queries = [
+    'title contains "Cancellation List" and mimeType = "application/vnd.google-apps.document"',
+    'title contains "Class Cancellation" and mimeType = "application/vnd.google-apps.document"',
+    'title contains "Cancellation" and mimeType = "application/vnd.google-apps.document"',
   ];
 
-  const filteredCookies = cleanCookie
-    .split(";")
-    .map(function(s) { return s.trim(); })
-    .filter(function(cookiePair) {
-      const name = cookiePair.split("=")[0].trim();
-      if (!name) return false;
-      if (disallowedCookies.indexOf(name) !== -1) return false;
-      if (name.indexOf("__Host-GMAIL") === 0 || name.indexOf("GMAIL") === 0) return false;
-      return true;
-    });
+  const foundFiles = [];
+  const seenIds = new Set();
 
-  const cookieHeader = filteredCookies.join("; ");
-
-  // Log cookie diagnostic summary
-  const cookieNames = filteredCookies.map(function(s) { return s.split("=")[0]; });
-  console.log(`Using ${cookieNames.length} session cookie(s): ${cookieNames.join(", ")}`);
-  console.log(`Total cookie payload length: ${cookieHeader.length} characters`);
-
-  // Ensure published doc URL includes not_in_iframe=true and authuser parameter
-  let fetchUrl = url;
-  if (fetchUrl.indexOf("not_in_iframe=true") === -1) {
-    fetchUrl += (fetchUrl.indexOf("?") === -1 ? "?" : "&") + "not_in_iframe=true";
-  }
-  if (DOC_CONFIG.AUTH_USER && fetchUrl.indexOf("authuser=") === -1) {
-    fetchUrl += "&authuser=" + encodeURIComponent(DOC_CONFIG.AUTH_USER);
+  for (const query of queries) {
+    try {
+      const files = DriveApp.searchFiles(query);
+      while (files.hasNext()) {
+        const file = files.next();
+        const id = file.getId();
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          foundFiles.push({
+            name: file.getName(),
+            id: id,
+            url: file.getUrl(),
+            lastUpdated: file.getLastUpdated(),
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`Query "${query}" search error: ${err.message}`);
+    }
   }
 
-  console.log("Fetching cancellation doc from: " + fetchUrl);
-
-  const response = UrlFetchApp.fetch(fetchUrl, {
-    headers: {
-      Cookie: cookieHeader,
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    followRedirects: true,
-    muteHttpExceptions: true,
-  });
-
-  const status = response.getResponseCode();
-  const text = response.getContentText();
-  console.log(`Doc fetch response HTTP ${status}, length: ${text.length}`);
-
-  if (status === 200 && hasDocCancellationContent(text)) {
-    // Cache valid HTML for resilient trigger execution
-    PropertiesService.getScriptProperties().setProperty("LAST_VALID_HTML", text);
-    PropertiesService.getScriptProperties().setProperty("LAST_VALID_HTML_DATE", new Date().toISOString());
-    return text;
-  }
-
-  // Diagnostic warning for inspection
-  const headers = response.getAllHeaders();
-  console.warn("Response headers: " + JSON.stringify(headers));
-  console.warn("Response preview: " + text.slice(0, 300).replace(/\s+/g, " "));
-
-  const isAccountChooserOrLogin =
-    text.indexOf("accounts.google.com") !== -1 ||
-    text.indexOf("accountchooser") !== -1 ||
-    text.indexOf("AccountsSignInUi") !== -1 ||
-    text.indexOf("ServiceLogin") !== -1;
-
-  // Fallback to recent HTML synced directly from the Chrome extension
-  const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
-  const cachedDate = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML_DATE");
-  if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
+  if (foundFiles.length === 0) {
     console.warn(
-      `Direct UrlFetchApp encountered Google auth restriction (${isAccountChooserOrLogin ? "Account Chooser" : "HTTP " + status}). ` +
-      `Falling back to cancellation HTML captured directly via Chrome extension (${cachedDate}).`
+      "No documents found matching 'Cancellation List' in your Drive.\n" +
+      "Make sure you are running Apps Script with your @bergen.org account and have opened/viewed the document in Google Drive."
     );
-    return cachedHtml;
+    return;
   }
 
-  if (isAccountChooserOrLogin) {
-    throw new Error(
-      `Failed to access BCA Class Cancellation List (Google redirected to Sign-in / Accounts).\n\n` +
-      `Google Apps Script's UrlFetchApp automatically strips the 'Cookie' header when requesting Google-owned services (docs.google.com) for platform security. As a result, Google Docs receives the cloud request as unauthenticated and redirects to the sign-in page.\n\n` +
-      `How to sync:\n` +
-      `1. In Chrome, open the BCA cancellation list (or click 'Open Doc in Tab' in the extension).\n` +
-      `2. In the BCA Absence Sync Chrome extension, click 'Sync Cookie Now'.\n` +
-      `The extension extracts the cancellation document directly from your authenticated Chrome browser session and pushes it to Google Sheets.`
-    );
+  console.log(`Found ${foundFiles.length} candidate file(s):`);
+  for (let i = 0; i < foundFiles.length; i++) {
+    const f = foundFiles[i];
+    console.log(`[${i + 1}] Name: "${f.name}"`);
+    console.log(`    Doc ID: ${f.id}`);
+    console.log(`    URL: ${f.url}`);
+    console.log(`    Last Updated: ${f.lastUpdated}`);
   }
 
-  throw new Error(
-    `Failed to access BCA Class Cancellation List (HTTP ${status}).\n\n` +
-    `Response length: ${text.length}. Preview: ${text.slice(0, 100).replace(/\s+/g, ' ')}\n\n` +
-    "The session cookie from the Chrome extension has expired or is invalid.\n" +
-    "Please open Chrome and click 'Sync Cookie Now' in the extension to refresh your credentials."
-  );
+  // Automatically save the first matching file ID if DOC_ID is not configured
+  const currentDocId = PropertiesService.getScriptProperties().getProperty("DOC_ID");
+  if (!currentDocId && foundFiles.length > 0) {
+    const chosen = foundFiles[0];
+    PropertiesService.getScriptProperties().setProperty("DOC_ID", chosen.id);
+    console.log(`Automatically set Script Property 'DOC_ID' to: ${chosen.id} ("${chosen.name}")`);
+  }
 }
 
 
 /**
- * Checks whether the HTML contains the cancellation document content.
+ * Extracts a Google Drive document ID from either a raw ID string or a full URL.
+ *
+ * Examples handled:
+ * - "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+ * - "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit"
+ * - "https://docs.google.com/document/u/1/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/preview"
  */
-function hasDocCancellationContent(html) {
-  if (!html) return false;
-  return (
-    html.includes("BCA Class Cancellation List") ||
-    (html.includes("Cancellation List") && /<table[^>]*>/i.test(html)) ||
-    (html.includes("Cancellation") && /<table[^>]*>/i.test(html)) ||
-    (/<table[^>]*>/i.test(html) && /Teacher/i.test(html))
-  );
+function extractDocId(urlOrId) {
+  if (!urlOrId) return "";
+  const trimmed = urlOrId.trim();
+
+  // If already just the ID (alphanumeric, dashes, underscores, length >= 20)
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  // Match /document/d/([a-zA-Z0-9_-]+) or /document/u/\d+/d/([a-zA-Z0-9_-]+)
+  const match = trimmed.match(/\/document\/(?:u\/\d+\/)?d\/([a-zA-Z0-9_-]+)/i);
+  if (match && match[1]) {
+    return match[1];
+  }
+
+  return trimmed;
 }
 
 
-
 /**
- * Parses the date from the document header.
+ * Parses the document date from the text header.
  *
  * Expected format:
  * "BCA Class Cancellation List
  * {Month} {Day}, {YYYY}"
- *
- * Handles single digit days with and without leading zero:
- * "September 6, 2026" or "September 06, 2026"
- *
- * Returns:
- * {
- *   year: number,
- *   month: number,       // 1-12 (no leading zero)
- *   day: number,         // 1-31 (no leading zero)
- *   formattedDate: string, // "M/D/YYYY" (e.g. "9/6/2026")
- *   dateObj: Date        // Native Date object for Sheets
- * }
  */
-function parseDocDate(htmlOrText) {
-  const text = normalizeHtmlToText(htmlOrText);
+function parseDocDate(text) {
+  if (!text) {
+    throw new Error("Cannot parse date: document body text is empty.");
+  }
+
+  // Normalize en-dashes, em-dashes, and non-breaking spaces
+  const cleanText = text
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\u00A0/g, " ");
 
   // Match header and date
   const headerRegex =
     /BCA\s+Class\s+Cancellation\s+List[\s\S]*?([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})/i;
 
-  let match = text.match(headerRegex);
+  let match = cleanText.match(headerRegex);
 
-  // Fallback: look for "Month Day, Year" anywhere before the table
+  // Fallback: look for "Month Day, Year" anywhere in the document
   if (!match) {
     const fallbackRegex = /([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})/i;
-    match = text.match(fallbackRegex);
+    match = cleanText.match(fallbackRegex);
   }
 
   if (!match) {
-    throw new Error("Could not find cancellation list date in document.");
+    throw new Error("Could not find cancellation list date in document header.");
   }
 
   const rawMonth = match[1].toLowerCase();
@@ -258,7 +207,7 @@ function parseDocDate(htmlOrText) {
 
   const month = DOC_MONTH_MAP[rawMonth];
   if (!month) {
-    throw new Error(`Unrecognized month name: "${match[1]}"`);
+    throw new Error(`Unrecognized month name in document header: "${match[1]}"`);
   }
 
   const day = parseInt(rawDay, 10);
@@ -274,8 +223,6 @@ function parseDocDate(htmlOrText) {
 
   // Format without leading zeroes: M/D/YYYY (e.g. 9/6/2026)
   const formattedDate = `${month}/${day}/${year}`;
-
-  // Date object at noon (12:00:00) to protect against any timezone day shifts
   const dateObj = new Date(year, month - 1, day, 12, 0, 0);
 
   return {
@@ -289,64 +236,58 @@ function parseDocDate(htmlOrText) {
 
 
 /**
- * Parses the 3-column cancellation table from the document HTML.
+ * Parses teacher cancellations natively from the document's Table element(s).
  *
  * Rules:
- * - Row 1 (index 0) is the header row: ignored.
- * - Column 3 (index 2) is the rightmost column: ignored.
- * - Column 1 (index 0): Teacher name string.
- * - Column 2 (index 1): Periods string, formatted according to rules.
+ * - Row 0 is the header row: ignored.
+ * - Column 0: Teacher name string.
+ * - Column 1: Periods string, formatted according to rules.
+ * - Column 2: Rightmost column, ignored.
  *
  * Returns array of [teacher, formattedPeriods].
  */
-function parseDocTable(html) {
-  const tableMatch = html.match(/<table[^>]*>([\s\S]*?)<\/table>/i);
-  if (!tableMatch) {
-    throw new Error("Could not find cancellation table in document HTML.");
+function parseDocTables(doc) {
+  const body = doc.getBody();
+  const tables = body.getTables();
+
+  if (!tables || tables.length === 0) {
+    throw new Error("No tables found in the Google Document.");
   }
 
-  const tableHtml = tableMatch[1];
-  const rowRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-  const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
-
-  const rawRows = [];
-  let rMatch;
-
-  while ((rMatch = rowRegex.exec(tableHtml)) !== null) {
-    const rowHtml = rMatch[1];
-    const cells = [];
-    let cMatch;
-
-    while ((cMatch = cellRegex.exec(rowHtml)) !== null) {
-      cells.push(cleanCellHtml(cMatch[1]));
-    }
-
-    if (cells.length > 0) {
-      rawRows.push(cells);
+  // Locate the cancellation table (table with > 1 row containing Teacher / Period headers or first table)
+  let targetTable = tables[0];
+  for (const t of tables) {
+    if (t.getNumRows() > 1) {
+      const headerText = t.getRow(0).getText().toLowerCase();
+      if (headerText.includes("teacher") || headerText.includes("period") || headerText.includes("absence")) {
+        targetTable = t;
+        break;
+      }
     }
   }
 
-  if (rawRows.length <= 1) {
-    // Only header row or empty table
+  const numRows = targetTable.getNumRows();
+  if (numRows <= 1) {
     return [];
   }
 
   const parsedRows = [];
 
   // Start at row index 1 (skipping header row 0)
-  for (let i = 1; i < rawRows.length; i++) {
-    const row = rawRows[i];
-    const teacher = (row[0] || "").trim();
-    const rawCol2 = row[1] || "";
+  for (let i = 1; i < numRows; i++) {
+    const row = targetTable.getRow(i);
+    const numCells = row.getNumCells();
+    if (numCells < 2) continue;
+
+    const teacher = row.getCell(0).getText().trim();
+    const rawCol2 = row.getCell(1).getText().trim();
 
     // Ignore completely empty rows
-    if (!teacher && !rawCol2.trim()) {
+    if (!teacher && !rawCol2) {
       continue;
     }
 
-    // If teacher exists, format periods according to rules
     const formattedPeriods = parsePeriodsCell(rawCol2);
-
     parsedRows.push([teacher, formattedPeriods]);
   }
 
@@ -408,53 +349,6 @@ function parsePeriodsCell(rawText) {
 
 
 /**
- * Cleans individual HTML table cell contents into plain text.
- */
-function cleanCellHtml(cellHtml) {
-  if (!cellHtml) return "";
-
-  return cellHtml
-    .replace(/<br\s*[\/]?>/gi, " ")
-    .replace(/<\/p>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#160;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#8211;|&ndash;/gi, "-")
-    .replace(/&#8212;|&mdash;/gi, "-")
-    .replace(/[\u2013\u2014]/g, "-")
-    .replace(/\u00A0/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-/**
- * Normalizes full document HTML into plain text for header and date parsing.
- */
-function normalizeHtmlToText(html) {
-  return html
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<br\s*[\/]?>/gi, " ")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&#160;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&#8211;|&ndash;/gi, "-")
-    .replace(/[\u2013\u2014]/g, "-")
-    .replace(/\u00A0/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .trim();
-}
-
-
-/**
  * Retrieves the target Google Sheet for doc-to-sheets sync.
  */
 function getDocTargetSheet() {
@@ -462,7 +356,7 @@ function getDocTargetSheet() {
 
   if (!spreadsheet) {
     throw new Error(
-      "No active spreadsheet found. Make sure this Apps Script is bound to the Google Sheet."
+      "No active spreadsheet found. Make sure this Apps Script is bound to your Google Sheet."
     );
   }
 
@@ -528,7 +422,7 @@ function createDocToSheetsTrigger(minutes) {
     .everyMinutes(minutes || 5)
     .create();
 
-  console.log(`Doc-to-sheets sync trigger created: runs every ${minutes || 5} minute(s).`);
+  console.log(`Doc-to-sheets sync trigger created: runs natively every ${minutes || 5} minute(s) in Google Cloud.`);
 }
 
 
@@ -544,181 +438,3 @@ function deleteDocToSheetsTriggers() {
   }
   console.log("Existing doc-to-sheets sync triggers removed.");
 }
-
-
-/**
- * Manual test function for doc-to-sheets execution in Apps Script editor.
- * If cached HTML from the Chrome extension is available, stages it to Sheets.
- * Otherwise, attempts direct fetch.
- */
-function testDocToSheetsSync() {
-  const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
-  const cachedDate = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML_DATE");
-
-  if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
-    console.log(`Using cancellation document HTML staged from Chrome extension (${cachedDate})...`);
-    const dateInfo = parseDocDate(cachedHtml);
-    console.log("Parsed date: " + dateInfo.formattedDate);
-    const rows = parseDocTable(cachedHtml);
-    console.log(`Parsed ${rows.length} teacher absence row(s).`);
-    const sheet = getDocTargetSheet();
-    writeDocDataToSheet(sheet, dateInfo, rows);
-    console.log("Doc to Sheets sync completed successfully using Chrome extension staged data.");
-    return;
-  }
-
-  syncDocToSheets();
-}
-
-
-/**
- * Web App HTTP POST handler.
- * Receives session cookie updates from the Chrome Cookie Tool extension.
- *
- * Payload format (JSON or URL-encoded):
- * {
- *   "cookie": "SID=...; HSID=...",
- *   "secret": "optional-secret-key",
- *   "triggerSync": false
- * }
- */
-function doPost(e) {
-  try {
-    let payload = {};
-
-    if (e && e.postData && e.postData.contents) {
-      try {
-        payload = JSON.parse(e.postData.contents);
-      } catch (jsonErr) {
-        // Fallback for form-encoded or plain string
-        if (e.postData.contents.indexOf("cookie=") !== -1) {
-          payload = e.parameter || {};
-        } else {
-          payload = { cookie: e.postData.contents };
-        }
-      }
-    } else if (e && e.parameter) {
-      payload = e.parameter;
-    }
-
-    const scriptProps = PropertiesService.getScriptProperties();
-    const expectedSecret = scriptProps.getProperty("SYNC_SECRET");
-
-    if (expectedSecret && payload.secret !== expectedSecret) {
-      return ContentService.createTextOutput(
-        JSON.stringify({
-          status: "error",
-          message: "Unauthorized: Invalid or missing sync secret.",
-        })
-      ).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    const cookie = (payload.cookie || "").trim();
-    const nowIso = new Date().toISOString();
-
-    if (cookie) {
-      scriptProps.setProperty("DOC_COOKIE", cookie);
-      scriptProps.setProperty("DOC_COOKIE_UPDATED_AT", nowIso);
-      console.log(`Updated DOC_COOKIE via Web App at ${nowIso}, length: ${cookie.length}`);
-    }
-
-    if (payload.authUser && payload.authUser.trim()) {
-      scriptProps.setProperty("AUTH_USER", payload.authUser.trim());
-    }
-
-    // Direct HTML ingestion: if Chrome extension fetched or extracted the document HTML directly
-    if (payload.html && hasDocCancellationContent(payload.html)) {
-      console.log(`Received full document HTML directly from Chrome extension (${payload.html.length} chars).`);
-      try {
-        const dateInfo = parseDocDate(payload.html);
-        const rows = parseDocTable(payload.html);
-        const sheet = getDocTargetSheet();
-        writeDocDataToSheet(sheet, dateInfo, rows);
-
-        // Cache valid HTML for subsequent trigger runs
-        scriptProps.setProperty("LAST_VALID_HTML", payload.html);
-        scriptProps.setProperty("LAST_VALID_HTML_DATE", nowIso);
-
-        console.log(`Directly staged ${rows.length} teacher absence row(s) for ${dateInfo.formattedDate}.`);
-        return ContentService.createTextOutput(
-          JSON.stringify({
-            status: "success",
-            message: `Document synced directly from Chrome! Staged ${rows.length} absence(s) for ${dateInfo.formattedDate}.`,
-            date: dateInfo.formattedDate,
-            rowCount: rows.length,
-            updatedAt: nowIso,
-          })
-        ).setMimeType(ContentService.MimeType.JSON);
-      } catch (directErr) {
-        console.warn("Direct HTML parsing warning: " + directErr.message);
-      }
-    }
-
-    if (!cookie && !payload.html) {
-      return ContentService.createTextOutput(
-        JSON.stringify({
-          status: "error",
-          message: "Missing 'cookie' or 'html' field in request body.",
-        })
-      ).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    let syncMessage = "Cookie successfully updated.";
-    const cachedHtml = scriptProps.getProperty("LAST_VALID_HTML");
-    if (payload.triggerSync === true || payload.triggerSync === "true") {
-      if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
-        try {
-          const dateInfo = parseDocDate(cachedHtml);
-          const rows = parseDocTable(cachedHtml);
-          const sheet = getDocTargetSheet();
-          writeDocDataToSheet(sheet, dateInfo, rows);
-          syncMessage = `Cookie updated and staged ${rows.length} absence(s) from document cache.`;
-        } catch (cacheErr) {
-          console.warn("Cached HTML staging error: " + cacheErr.message);
-        }
-      } else {
-        syncMessage = "Cookie successfully synchronized. Keep the cancellation document open in Chrome for instant table sync.";
-      }
-    }
-
-    return ContentService.createTextOutput(
-      JSON.stringify({
-        status: "success",
-        message: syncMessage,
-        updatedAt: nowIso,
-      })
-    ).setMimeType(ContentService.MimeType.JSON);
-  } catch (err) {
-    console.error("doPost error: " + err.toString());
-    return ContentService.createTextOutput(
-      JSON.stringify({
-        status: "error",
-        message: err.toString(),
-      })
-    ).setMimeType(ContentService.MimeType.JSON);
-  }
-}
-
-
-/**
- * Web App HTTP GET handler.
- * Provides a health check endpoint for testing the Web App deployment.
- */
-function doGet(e) {
-  const scriptProps = PropertiesService.getScriptProperties();
-  const hasCookie = !!scriptProps.getProperty("DOC_COOKIE");
-  const updatedAt = scriptProps.getProperty("DOC_COOKIE_UPDATED_AT") || null;
-  const hasSecret = !!scriptProps.getProperty("SYNC_SECRET");
-
-  return ContentService.createTextOutput(
-    JSON.stringify({
-      status: "ok",
-      service: "BCA Absence Sync Web App",
-      hasActiveCookie: hasCookie,
-      cookieUpdatedAt: updatedAt,
-      requiresSecret: hasSecret,
-      serverTime: new Date().toISOString(),
-    })
-  ).setMimeType(ContentService.MimeType.JSON);
-}
-

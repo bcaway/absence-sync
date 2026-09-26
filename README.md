@@ -1,58 +1,50 @@
 # absence-sync
 
-Automated pipeline syncing BCA teacher attendance and class cancellations from the published Google Doc to Google Sheets and Supabase.
+Automated pipeline syncing BCA teacher attendance and class cancellations from the Google Doc directly to Google Sheets and Supabase.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Chrome["Chrome Extension<br/>(chrome-cookie-tool)"]
-    Doc["Published Google Doc<br/>(Class Cancellation List)"]
+    Doc["BCA Cancellation Google Doc<br/>(DocumentApp.openById)"]
     Sheet["Google Sheet<br/>(A1: Date, A: Teacher, B: Periods)"]
     Supabase["Supabase Edge Function<br/>(sync-absences)"]
     DB[("Supabase DB<br/>(teacher_absences)")]
 
-    Chrome -.->|"POST session cookie"| GAS["doc-to-sheets (Apps Script)"]
-    GAS -->|"fetches with session cookie"| Doc
-    Doc -->|"extracts cancellations"| GAS
-    GAS --> Sheet
+    Doc -->|"doc-to-sheets (Native Apps Script)"| Sheet
     Sheet -->|"sheets-to-supabase (Apps Script)"| Supabase
     Supabase --> DB
 ```
 
 ---
 
-## 0. chrome-cookie-tool (Chrome Extension)
+## 1. doc-to-sheets (Native Google Workspace)
 
-Located in `../chrome-cookie-tool`, this Manifest V3 Chrome Extension solves the domain-sign-in restriction on the published Google Doc. Whenever you browse Chrome on your laptop, it captures your active Google session cookies and syncs them to `doc-to-sheets` via a Web App endpoint (`doPost`), keeping `DOC_COOKIE` fresh 24/7 without needing a dedicated server.
+Natively reads the BCA Class Cancellation Google Doc using Google Apps Script's `DocumentApp`, parses the header date and cancellation table, and populates the Google Sheet.
 
-See [chrome-cookie-tool README](../../chrome-cookie-tool/README.md) for extension installation and setup.
-
----
-
-## 1. doc-to-sheets
-
-Google Apps Script deployed as a Web App that receives session cookies from `chrome-cookie-tool`, fetches the published BCA Class Cancellation List document, parses the date and teacher absences table, and populates the Google Sheet.
+**Key Advantages**:
+- **Zero Cookies & Zero Extensions**: Uses native Google Workspace authentication under your `@bergen.org` identity.
+- **Autonomous 24/7 Cloud Execution**: Runs on a time-driven trigger directly in Google's cloud without needing any computer turned on.
+- **Instant Execution**: Parses document and updates sheets in under 400 milliseconds.
 
 ### Setup Instructions
 
 1. Open your target Google Sheet.
 2. Click **Extensions** > **Apps Script**.
-3. Copy the contents of [`doc-to-sheets/Code.gs`](./doc-to-sheets/Code.gs) into `Code.gs`.
-4. (Optional) If editing the manifest, enable "Show appsscript.json manifest file in editor" under Project Settings and copy [`doc-to-sheets/appsscript.json`](./doc-to-sheets/appsscript.json).
-5. **Deploy as Web App**:
-   - Click **Deploy** > **New deployment** > Select type: **Web app**.
-   - **Execute as**: `Me`
-   - **Who has access**: `Anyone`
-   - Click **Deploy** and copy the **Web app URL** into the Chrome extension settings.
-6. **Automation**:
-   - Run `createDocToSheetsFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes in Google's cloud using the fresh cookie.
-   - Alternatively, run `createDocToSheetsOneMinuteTrigger()` for 1-minute updates.
-   - Run `testDocToSheetsSync()` to manually test.
+3. Copy [`doc-to-sheets/Code.gs`](./doc-to-sheets/Code.gs) into `Code.gs`.
+4. (Optional) In **Project Settings**, enable "Show 'appsscript.json' manifest file in editor" and copy [`doc-to-sheets/appsscript.json`](./doc-to-sheets/appsscript.json).
+5. **Set the Document ID**:
+   - In Google Drive (under your `@bergen.org` account), open or search for the BCA Class Cancellation Document.
+   - Copy the document ID from the URL (`https://docs.google.com/document/d/<DOCUMENT_ID>/edit`).
+   - In Apps Script, go to **Project Settings** > **Script Properties**, add property `DOC_ID` with your document ID (or paste the full URL).
+   - *Tip*: You can also run `searchDriveForCancellationDoc()` in the Apps Script editor to auto-discover it!
+6. **Test & Automate**:
+   - Run `testDocToSheetsSync()` in the Apps Script editor to verify data is written to the sheet.
+   - Run `createDocToSheetsFiveMinuteTrigger()` to automate 24/7 background sync every 5 minutes in Google Cloud!
 
 ### Google Sheet Format
 
-- **Cell A1**: Date in `M/D/YYYY` format without leading zeroes (e.g. `9/6/2026`).
+- **Cell A1**: Date formatted as `M/D/YYYY` without leading zeroes (e.g. `9/6/2026`).
 - **Row 2 onwards**:
   - **Column A**: Teacher name.
   - **Column B**: Normalized periods impacted:
@@ -67,7 +59,7 @@ Google Apps Script bound to the Google Sheet that reads the staged date and teac
 
 ### Setup Instructions
 
-1. In the same (or bound) Google Apps Script project, configure:
+1. In the same (or bound) Google Apps Script project, configure Script Properties:
    - `SUPABASE_URL`: Your Supabase project URL (e.g. `https://xyz.supabase.co`).
    - `SYNC_SECRET`: Bearer authentication secret matching your Supabase environment.
 2. Run `createFiveMinuteTrigger()` to automate sync to Supabase.
