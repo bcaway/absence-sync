@@ -181,13 +181,12 @@ function fetchPublishedDocHtml(url) {
 
   if (isAccountChooserOrLogin) {
     throw new Error(
-      `Failed to access BCA Class Cancellation List (Google redirected to Account Chooser / Sign-in).\n\n` +
-      `Google's servers redirected the fetch to accounts.google.com/signin/accountchooser.\n` +
-      `Why this occurs:\n` +
-      `1. Multiple Google accounts signed into Chrome (account collision).\n` +
-      `2. Google Cloud IP restriction: Google blocks session cookie replay from cloud datacenter IPs.\n\n` +
-      `Resolution:\n` +
-      `Open the BCA Absence Sync Chrome extension and click 'Sync Cookie Now'. The extension captures the rendered document HTML directly from Chrome and syncs it to Sheets seamlessly.`
+      `Failed to access BCA Class Cancellation List (Google redirected to Sign-in / Accounts).\n\n` +
+      `Google Apps Script's UrlFetchApp automatically strips the 'Cookie' header when requesting Google-owned services (docs.google.com) for platform security. As a result, Google Docs receives the cloud request as unauthenticated and redirects to the sign-in page.\n\n` +
+      `How to sync:\n` +
+      `1. In Chrome, open the BCA cancellation list (or click 'Open Doc in Tab' in the extension).\n` +
+      `2. In the BCA Absence Sync Chrome extension, click 'Sync Cookie Now'.\n` +
+      `The extension extracts the cancellation document directly from your authenticated Chrome browser session and pushes it to Google Sheets.`
     );
   }
 
@@ -549,8 +548,25 @@ function deleteDocToSheetsTriggers() {
 
 /**
  * Manual test function for doc-to-sheets execution in Apps Script editor.
+ * If cached HTML from the Chrome extension is available, stages it to Sheets.
+ * Otherwise, attempts direct fetch.
  */
 function testDocToSheetsSync() {
+  const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
+  const cachedDate = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML_DATE");
+
+  if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
+    console.log(`Using cancellation document HTML staged from Chrome extension (${cachedDate})...`);
+    const dateInfo = parseDocDate(cachedHtml);
+    console.log("Parsed date: " + dateInfo.formattedDate);
+    const rows = parseDocTable(cachedHtml);
+    console.log(`Parsed ${rows.length} teacher absence row(s).`);
+    const sheet = getDocTargetSheet();
+    writeDocDataToSheet(sheet, dateInfo, rows);
+    console.log("Doc to Sheets sync completed successfully using Chrome extension staged data.");
+    return;
+  }
+
   syncDocToSheets();
 }
 
