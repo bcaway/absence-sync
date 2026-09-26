@@ -9,8 +9,7 @@
 const DOC_CONFIG = {
   get DOC_URL() {
     return (
-      PropertiesService.getScriptProperties().getProperty("DOC_URL") ||
-      "https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub"
+      PropertiesService.getScriptProperties().getProperty("DOC_URL")
     );
   },
 
