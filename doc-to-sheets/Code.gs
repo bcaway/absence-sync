@@ -11,6 +11,9 @@ const DOC_CONFIG = {
     PropertiesService.getScriptProperties().getProperty("DOC_URL") ||
     "https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub",
 
+  AUTH_USER:
+    PropertiesService.getScriptProperties().getProperty("AUTH_USER") || "kabsek30@bergen.org",
+
   // Cookie synchronized automatically from the Chrome Extension
   get DOC_COOKIE() {
     return PropertiesService.getScriptProperties().getProperty("DOC_COOKIE");
@@ -68,6 +71,13 @@ function fetchPublishedDocHtml(url) {
   const cookie = DOC_CONFIG.DOC_COOKIE;
 
   if (!cookie || !cookie.trim()) {
+    // Check if we have valid HTML synchronized directly from the Chrome extension
+    const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
+    if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
+      console.log("No DOC_COOKIE found, but using latest HTML synchronized directly from Chrome extension.");
+      return cachedHtml;
+    }
+
     throw new Error(
       "Missing DOC_COOKIE in Script Properties.\n\n" +
       "The BCA Class Cancellation document requires domain authentication.\n" +
@@ -77,26 +87,55 @@ function fetchPublishedDocHtml(url) {
 
   const cleanCookie = cookie.replace(/^Cookie:\s*/i, "").trim();
 
-  // Log cookie diagnostic summary (cookie names and character count)
-  const cookieNames = cleanCookie
-    .split(";")
-    .map(function(s) { return s.trim().split("=")[0]; })
-    .filter(Boolean);
-  console.log(`Using ${cookieNames.length} session cookie(s): ${cookieNames.join(", ")}`);
-  console.log(`Total cookie payload length: ${cleanCookie.length} characters`);
+  // Filter out known problematic cookies that cause Google to redirect to Account Chooser
+  const disallowedCookies = [
+    "ACCOUNT_CHOOSER",
+    "PLAY_ACTIVE_ACCOUNT",
+    "GG_ACTIVE_ACCOUNT",
+    "GG_XSRF",
+    "GMAIL_AT",
+    "__Host-GAPS",
+    "LSID",
+    "__Host-1PLSID",
+    "__Host-3PLSID",
+    "LSOLH",
+    "SNID",
+    "SMSV",
+    "COMPASS",
+  ];
 
-  // Ensure published doc URL includes not_in_iframe=true parameter
-  // Without this parameter, Google's server always returns a 401 JavaScript loader
+  const filteredCookies = cleanCookie
+    .split(";")
+    .map(function(s) { return s.trim(); })
+    .filter(function(cookiePair) {
+      const name = cookiePair.split("=")[0].trim();
+      if (!name) return false;
+      if (disallowedCookies.indexOf(name) !== -1) return false;
+      if (name.indexOf("__Host-GMAIL") === 0 || name.indexOf("GMAIL") === 0) return false;
+      return true;
+    });
+
+  const cookieHeader = filteredCookies.join("; ");
+
+  // Log cookie diagnostic summary
+  const cookieNames = filteredCookies.map(function(s) { return s.split("=")[0]; });
+  console.log(`Using ${cookieNames.length} session cookie(s): ${cookieNames.join(", ")}`);
+  console.log(`Total cookie payload length: ${cookieHeader.length} characters`);
+
+  // Ensure published doc URL includes not_in_iframe=true and authuser parameter
   let fetchUrl = url;
   if (fetchUrl.indexOf("not_in_iframe=true") === -1) {
     fetchUrl += (fetchUrl.indexOf("?") === -1 ? "?" : "&") + "not_in_iframe=true";
+  }
+  if (DOC_CONFIG.AUTH_USER && fetchUrl.indexOf("authuser=") === -1) {
+    fetchUrl += "&authuser=" + encodeURIComponent(DOC_CONFIG.AUTH_USER);
   }
 
   console.log("Fetching cancellation doc from: " + fetchUrl);
 
   const response = UrlFetchApp.fetch(fetchUrl, {
     headers: {
-      Cookie: cleanCookie,
+      Cookie: cookieHeader,
       "User-Agent":
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       Accept:
@@ -112,6 +151,9 @@ function fetchPublishedDocHtml(url) {
   console.log(`Doc fetch response HTTP ${status}, length: ${text.length}`);
 
   if (status === 200 && hasDocCancellationContent(text)) {
+    // Cache valid HTML for resilient trigger execution
+    PropertiesService.getScriptProperties().setProperty("LAST_VALID_HTML", text);
+    PropertiesService.getScriptProperties().setProperty("LAST_VALID_HTML_DATE", new Date().toISOString());
     return text;
   }
 
@@ -120,16 +162,41 @@ function fetchPublishedDocHtml(url) {
   console.warn("Response headers: " + JSON.stringify(headers));
   console.warn("Response preview: " + text.slice(0, 300).replace(/\s+/g, " "));
 
-  if (status === 401 || status === 403 || !hasDocCancellationContent(text)) {
+  const isAccountChooserOrLogin =
+    text.indexOf("accounts.google.com") !== -1 ||
+    text.indexOf("accountchooser") !== -1 ||
+    text.indexOf("AccountsSignInUi") !== -1 ||
+    text.indexOf("ServiceLogin") !== -1;
+
+  // Fallback to recent HTML synced directly from the Chrome extension
+  const cachedHtml = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML");
+  const cachedDate = PropertiesService.getScriptProperties().getProperty("LAST_VALID_HTML_DATE");
+  if (cachedHtml && hasDocCancellationContent(cachedHtml)) {
+    console.warn(
+      `Direct UrlFetchApp encountered Google auth restriction (${isAccountChooserOrLogin ? "Account Chooser" : "HTTP " + status}). ` +
+      `Falling back to cancellation HTML captured directly via Chrome extension (${cachedDate}).`
+    );
+    return cachedHtml;
+  }
+
+  if (isAccountChooserOrLogin) {
     throw new Error(
-      `Failed to access BCA Class Cancellation List (HTTP ${status}).\n\n` +
-      `Response length: ${text.length}. Preview: ${text.slice(0, 100).replace(/\s+/g, ' ')}\n\n` +
-      "The session cookie from the Chrome extension has expired or is invalid.\n" +
-      "Please open Chrome and click 'Sync Cookie Now' in the extension to refresh your credentials."
+      `Failed to access BCA Class Cancellation List (Google redirected to Account Chooser / Sign-in).\n\n` +
+      `Google's servers redirected the fetch to accounts.google.com/signin/accountchooser.\n` +
+      `Why this occurs:\n` +
+      `1. Multiple Google accounts signed into Chrome (account collision).\n` +
+      `2. Google Cloud IP restriction: Google blocks session cookie replay from cloud datacenter IPs.\n\n` +
+      `Resolution:\n` +
+      `Open the BCA Absence Sync Chrome extension and click 'Sync Cookie Now'. The extension captures the rendered document HTML directly from Chrome and syncs it to Sheets seamlessly.`
     );
   }
 
-  return text;
+  throw new Error(
+    `Failed to access BCA Class Cancellation List (HTTP ${status}).\n\n` +
+    `Response length: ${text.length}. Preview: ${text.slice(0, 100).replace(/\s+/g, ' ')}\n\n` +
+    "The session cookie from the Chrome extension has expired or is invalid.\n" +
+    "Please open Chrome and click 'Sync Cookie Now' in the extension to refresh your credentials."
+  );
 }
 
 
@@ -539,6 +606,10 @@ function doPost(e) {
       console.log(`Updated DOC_COOKIE via Web App at ${nowIso}, length: ${cookie.length}`);
     }
 
+    if (payload.authUser && payload.authUser.trim()) {
+      scriptProps.setProperty("AUTH_USER", payload.authUser.trim());
+    }
+
     // Direct HTML ingestion: if Chrome extension fetched or extracted the document HTML directly
     if (payload.html && hasDocCancellationContent(payload.html)) {
       console.log(`Received full document HTML directly from Chrome extension (${payload.html.length} chars).`);
@@ -547,6 +618,10 @@ function doPost(e) {
         const rows = parseDocTable(payload.html);
         const sheet = getDocTargetSheet();
         writeDocDataToSheet(sheet, dateInfo, rows);
+
+        // Cache valid HTML for subsequent trigger runs
+        scriptProps.setProperty("LAST_VALID_HTML", payload.html);
+        scriptProps.setProperty("LAST_VALID_HTML_DATE", nowIso);
 
         console.log(`Directly staged ${rows.length} teacher absence row(s) for ${dateInfo.formattedDate}.`);
         return ContentService.createTextOutput(
