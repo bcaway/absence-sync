@@ -77,8 +77,24 @@ function fetchPublishedDocHtml(url) {
 
   const cleanCookie = cookie.replace(/^Cookie:\s*/i, "").trim();
 
-  console.log("Fetching cancellation doc with session cookie from Chrome extension...");
-  const response = UrlFetchApp.fetch(url, {
+  // Log cookie diagnostic summary (cookie names and character count)
+  const cookieNames = cleanCookie
+    .split(";")
+    .map(function(s) { return s.trim().split("=")[0]; })
+    .filter(Boolean);
+  console.log(`Using ${cookieNames.length} session cookie(s): ${cookieNames.join(", ")}`);
+  console.log(`Total cookie payload length: ${cleanCookie.length} characters`);
+
+  // Ensure published doc URL includes not_in_iframe=true parameter
+  // Without this parameter, Google's server always returns a 401 JavaScript loader
+  let fetchUrl = url;
+  if (fetchUrl.indexOf("not_in_iframe=true") === -1) {
+    fetchUrl += (fetchUrl.indexOf("?") === -1 ? "?" : "&") + "not_in_iframe=true";
+  }
+
+  console.log("Fetching cancellation doc from: " + fetchUrl);
+
+  const response = UrlFetchApp.fetch(fetchUrl, {
     headers: {
       Cookie: cleanCookie,
       "User-Agent":
@@ -99,9 +115,15 @@ function fetchPublishedDocHtml(url) {
     return text;
   }
 
+  // Diagnostic warning for inspection
+  const headers = response.getAllHeaders();
+  console.warn("Response headers: " + JSON.stringify(headers));
+  console.warn("Response preview: " + text.slice(0, 300).replace(/\s+/g, " "));
+
   if (status === 401 || status === 403 || !hasDocCancellationContent(text)) {
     throw new Error(
       `Failed to access BCA Class Cancellation List (HTTP ${status}).\n\n` +
+      `Response length: ${text.length}. Preview: ${text.slice(0, 100).replace(/\s+/g, ' ')}\n\n` +
       "The session cookie from the Chrome extension has expired or is invalid.\n" +
       "Please open Chrome and click 'Sync Cookie Now' in the extension to refresh your credentials."
     );
@@ -509,21 +531,46 @@ function doPost(e) {
     }
 
     const cookie = (payload.cookie || "").trim();
-    if (!cookie) {
+    const nowIso = new Date().toISOString();
+
+    if (cookie) {
+      scriptProps.setProperty("DOC_COOKIE", cookie);
+      scriptProps.setProperty("DOC_COOKIE_UPDATED_AT", nowIso);
+      console.log(`Updated DOC_COOKIE via Web App at ${nowIso}, length: ${cookie.length}`);
+    }
+
+    // Direct HTML ingestion: if Chrome extension fetched or extracted the document HTML directly
+    if (payload.html && hasDocCancellationContent(payload.html)) {
+      console.log(`Received full document HTML directly from Chrome extension (${payload.html.length} chars).`);
+      try {
+        const dateInfo = parseDocDate(payload.html);
+        const rows = parseDocTable(payload.html);
+        const sheet = getDocTargetSheet();
+        writeDocDataToSheet(sheet, dateInfo, rows);
+
+        console.log(`Directly staged ${rows.length} teacher absence row(s) for ${dateInfo.formattedDate}.`);
+        return ContentService.createTextOutput(
+          JSON.stringify({
+            status: "success",
+            message: `Document synced directly from Chrome! Staged ${rows.length} absence(s) for ${dateInfo.formattedDate}.`,
+            date: dateInfo.formattedDate,
+            rowCount: rows.length,
+            updatedAt: nowIso,
+          })
+        ).setMimeType(ContentService.MimeType.JSON);
+      } catch (directErr) {
+        console.warn("Direct HTML parsing warning: " + directErr.message);
+      }
+    }
+
+    if (!cookie && !payload.html) {
       return ContentService.createTextOutput(
         JSON.stringify({
           status: "error",
-          message: "Missing 'cookie' field in request body.",
+          message: "Missing 'cookie' or 'html' field in request body.",
         })
       ).setMimeType(ContentService.MimeType.JSON);
     }
-
-    // Save cookie and timestamp
-    const nowIso = new Date().toISOString();
-    scriptProps.setProperty("DOC_COOKIE", cookie);
-    scriptProps.setProperty("DOC_COOKIE_UPDATED_AT", nowIso);
-
-    console.log(`Updated DOC_COOKIE via Web App at ${nowIso}, length: ${cookie.length}`);
 
     let syncMessage = "Cookie successfully updated.";
     if (payload.triggerSync === true || payload.triggerSync === "true") {
