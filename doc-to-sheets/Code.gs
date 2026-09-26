@@ -7,8 +7,22 @@
  */
 
 const DOC_CONFIG = {
-  DOC_URL:
-    PropertiesService.getScriptProperties().getProperty("DOC_URL")
+  get DOC_URL() {
+    return (
+      PropertiesService.getScriptProperties().getProperty("DOC_URL") ||
+      "https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub"
+    );
+  },
+
+  // Optional: If the original Google Doc ID is known and accessible
+  get DOC_ID() {
+    return PropertiesService.getScriptProperties().getProperty("DOC_ID");
+  },
+
+  // Optional: Browser session cookie if published doc is domain-restricted
+  get DOC_COOKIE() {
+    return PropertiesService.getScriptProperties().getProperty("DOC_COOKIE");
+  },
 };
 
 const DOC_MONTH_MAP = {
@@ -31,21 +45,33 @@ const DOC_MONTH_MAP = {
  * Main sync orchestrator for doc-to-sheets.
  */
 function syncDocToSheets() {
-  const url = DOC_CONFIG.DOC_URL;
-  if (!url) {
-    throw new Error("DOC_URL is not configured.");
+  let dateInfo;
+  let rows;
+
+  // Path A: Direct DocumentApp access if DOC_ID is configured
+  if (DOC_CONFIG.DOC_ID) {
+    console.log("Using DocumentApp with DOC_ID: " + DOC_CONFIG.DOC_ID);
+    const docData = readFromDocumentApp(DOC_CONFIG.DOC_ID);
+    dateInfo = docData.dateInfo;
+    rows = docData.rows;
+  } else {
+    // Path B: Fetch published web document
+    const url = DOC_CONFIG.DOC_URL;
+    if (!url) {
+      throw new Error("DOC_URL is not configured.");
+    }
+
+    console.log("Fetching published doc from: " + url);
+    const html = fetchPublishedDocHtml(url);
+
+    console.log("Parsing document date...");
+    dateInfo = parseDocDate(html);
+    console.log("Parsed date: " + dateInfo.formattedDate);
+
+    console.log("Parsing cancellation table...");
+    rows = parseDocTable(html);
+    console.log(`Parsed ${rows.length} teacher absence row(s).`);
   }
-
-  console.log("Fetching published doc from: " + url);
-  const html = fetchPublishedDocHtml(url);
-
-  console.log("Parsing document date...");
-  const dateInfo = parseDocDate(html);
-  console.log("Parsed date: " + dateInfo.formattedDate);
-
-  console.log("Parsing cancellation table...");
-  const rows = parseDocTable(html);
-  console.log(`Parsed ${rows.length} teacher absence row(s).`);
 
   const sheet = getDocTargetSheet();
   writeDocDataToSheet(sheet, dateInfo, rows);
@@ -55,12 +81,74 @@ function syncDocToSheets() {
 
 
 /**
+ * Reads directly from Google Docs if DOC_ID is provided.
+ */
+function readFromDocumentApp(docId) {
+  const doc = DocumentApp.openById(docId);
+  const body = doc.getBody();
+  const text = body.getText();
+  const dateInfo = parseDocDate(text);
+
+  const tables = body.getTables();
+  if (tables.length === 0) {
+    throw new Error("No table found in Google Document.");
+  }
+
+  const table = tables[0];
+  const numRows = table.getNumRows();
+  const rows = [];
+
+  for (let i = 1; i < numRows; i++) {
+    const tableRow = table.getRow(i);
+    const teacher = tableRow.getCell(0).getText().trim();
+    const rawCol2 = tableRow.getCell(1).getText().trim();
+
+    if (!teacher && !rawCol2) {
+      continue;
+    }
+
+    const formattedPeriods = parsePeriodsCell(rawCol2);
+    rows.push([teacher, formattedPeriods]);
+  }
+
+  return { dateInfo, rows };
+}
+
+
+/**
  * Fetches published Google Doc HTML.
- * Handles both public published documents and domain-restricted published documents
- * by trying an authenticated request with the user's OAuth token and falling back
- * to a direct public fetch.
  */
 function fetchPublishedDocHtml(url) {
+  // Strategy 0: If DOC_COOKIE is configured in Script Properties
+  if (DOC_CONFIG.DOC_COOKIE) {
+    try {
+      console.log("Attempting fetch with provided DOC_COOKIE...");
+      const cleanCookie = DOC_CONFIG.DOC_COOKIE.replace(/^Cookie:\s*/i, "").trim();
+      const response = UrlFetchApp.fetch(url, {
+        headers: {
+          Cookie: cleanCookie,
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        followRedirects: true,
+        muteHttpExceptions: true,
+      });
+      const status = response.getResponseCode();
+      const text = response.getContentText();
+      console.log(`Cookie fetch HTTP ${status}, length: ${text.length}`);
+
+      if (hasDocCancellationContent(text)) {
+        console.log("Cancellation content detected with session cookie.");
+        return text;
+      } else {
+        console.warn(`Cookie fetch did not return cancellation content. HTTP ${status}, preview: ${text.slice(0, 150)}`);
+      }
+    } catch (e) {
+      console.warn("Cookie fetch exception: " + e.message);
+    }
+  }
+
   // Strategy 1: Direct public fetch
   try {
     console.log("Attempting direct fetch of published doc URL...");
@@ -136,10 +224,13 @@ function fetchPublishedDocHtml(url) {
   }
 
   throw new Error(
-    "Failed to fetch cancellation list content from: " + url + "\n" +
-    "The page returned did not contain the BCA Class Cancellation List or table. " +
-    "If the document is domain-restricted, make sure the executing account has access, " +
-    "or check that the document has been published to the web."
+    "Failed to fetch cancellation list content from: " + url + "\n\n" +
+    "Google returned HTTP 401/403 because the document was published with 'Require viewers to sign in with their domain account' enabled.\n" +
+    "Server-side scripts cannot perform interactive Google logins without session cookies.\n\n" +
+    "To resolve this, choose one of the following options:\n" +
+    "1. (Recommended) In the Google Doc, go to File > Share > Publish to web, expand 'Published content & settings', and uncheck 'Require viewers to sign in'.\n" +
+    "2. If you have the standard Google Doc ID, set DOC_ID in Script Properties.\n" +
+    "3. Set DOC_COOKIE in Script Properties with your browser session cookie from viewing the page."
   );
 }
 
@@ -152,7 +243,8 @@ function hasDocCancellationContent(html) {
   return (
     html.includes("BCA Class Cancellation List") ||
     (html.includes("Cancellation List") && /<table[^>]*>/i.test(html)) ||
-    (html.includes("Cancellation") && /<table[^>]*>/i.test(html))
+    (html.includes("Cancellation") && /<table[^>]*>/i.test(html)) ||
+    (/<table[^>]*>/i.test(html) && /Teacher/i.test(html))
   );
 }
 
@@ -217,9 +309,8 @@ function tryFetchDocFromDrive() {
  *   dateObj: Date        // Native Date object for Sheets
  * }
  */
-function parseDocDate(html) {
-  // Normalize HTML tags and whitespace
-  const text = normalizeHtmlToText(html);
+function parseDocDate(htmlOrText) {
+  const text = normalizeHtmlToText(htmlOrText);
 
   // Match header and date
   const headerRegex =
@@ -537,3 +628,116 @@ function deleteDocToSheetsTriggers() {
 function testDocToSheetsSync() {
   syncDocToSheets();
 }
+
+
+/**
+ * Web App HTTP POST handler.
+ * Receives session cookie updates from the Chrome Cookie Tool extension.
+ *
+ * Payload format (JSON or URL-encoded):
+ * {
+ *   "cookie": "SID=...; HSID=...",
+ *   "secret": "optional-secret-key",
+ *   "triggerSync": false
+ * }
+ */
+function doPost(e) {
+  try {
+    let payload = {};
+
+    if (e && e.postData && e.postData.contents) {
+      try {
+        payload = JSON.parse(e.postData.contents);
+      } catch (jsonErr) {
+        // Fallback for form-encoded or plain string
+        if (e.postData.contents.indexOf("cookie=") !== -1) {
+          payload = e.parameter || {};
+        } else {
+          payload = { cookie: e.postData.contents };
+        }
+      }
+    } else if (e && e.parameter) {
+      payload = e.parameter;
+    }
+
+    const scriptProps = PropertiesService.getScriptProperties();
+    const expectedSecret = scriptProps.getProperty("SYNC_SECRET");
+
+    if (expectedSecret && payload.secret !== expectedSecret) {
+      return ContentService.createTextOutput(
+        JSON.stringify({
+          status: "error",
+          message: "Unauthorized: Invalid or missing sync secret.",
+        })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const cookie = (payload.cookie || "").trim();
+    if (!cookie) {
+      return ContentService.createTextOutput(
+        JSON.stringify({
+          status: "error",
+          message: "Missing 'cookie' field in request body.",
+        })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // Save cookie and timestamp
+    const nowIso = new Date().toISOString();
+    scriptProps.setProperty("DOC_COOKIE", cookie);
+    scriptProps.setProperty("DOC_COOKIE_UPDATED_AT", nowIso);
+
+    console.log(`Updated DOC_COOKIE via Web App at ${nowIso}, length: ${cookie.length}`);
+
+    let syncMessage = "Cookie successfully updated.";
+    if (payload.triggerSync === true || payload.triggerSync === "true") {
+      try {
+        syncDocToSheets();
+        syncMessage = "Cookie updated and sync executed successfully.";
+      } catch (syncErr) {
+        console.error("Immediate sync error after cookie update: " + syncErr.message);
+        syncMessage = "Cookie updated, but sync execution failed: " + syncErr.message;
+      }
+    }
+
+    return ContentService.createTextOutput(
+      JSON.stringify({
+        status: "success",
+        message: syncMessage,
+        updatedAt: nowIso,
+      })
+    ).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    console.error("doPost error: " + err.toString());
+    return ContentService.createTextOutput(
+      JSON.stringify({
+        status: "error",
+        message: err.toString(),
+      })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+
+/**
+ * Web App HTTP GET handler.
+ * Provides a health check endpoint for testing the Web App deployment.
+ */
+function doGet(e) {
+  const scriptProps = PropertiesService.getScriptProperties();
+  const hasCookie = !!scriptProps.getProperty("DOC_COOKIE");
+  const updatedAt = scriptProps.getProperty("DOC_COOKIE_UPDATED_AT") || null;
+  const hasSecret = !!scriptProps.getProperty("SYNC_SECRET");
+
+  return ContentService.createTextOutput(
+    JSON.stringify({
+      status: "ok",
+      service: "BCA Absence Sync Web App",
+      hasActiveCookie: hasCookie,
+      cookieUpdatedAt: updatedAt,
+      requiresSecret: hasSecret,
+      serverTime: new Date().toISOString(),
+    })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+

@@ -6,15 +6,27 @@ Automated pipeline syncing BCA teacher attendance and class cancellations from t
 
 ```mermaid
 flowchart LR
+    Chrome["Chrome Extension<br/>(chrome-cookie-tool)"]
     Doc["Published Google Doc<br/>(Class Cancellation List)"]
     Sheet["Google Sheet<br/>(A1: Date, A: Teacher, B: Periods)"]
     Supabase["Supabase Edge Function<br/>(sync-absences)"]
     DB[("Supabase DB<br/>(teacher_absences)")]
 
-    Doc -->|"doc-to-sheets (Apps Script)"| Sheet
+    Chrome -.->|"POST session cookie"| GAS["doc-to-sheets (Apps Script)"]
+    GAS -->|"fetches with session cookie"| Doc
+    Doc -->|"extracts cancellations"| GAS
+    GAS --> Sheet
     Sheet -->|"sheets-to-supabase (Apps Script)"| Supabase
     Supabase --> DB
 ```
+
+---
+
+## 0. chrome-cookie-tool (Chrome Extension)
+
+Located in `../chrome-cookie-tool`, this Manifest V3 Chrome Extension solves the domain-sign-in restriction on the published Google Doc. Whenever you browse Chrome on your laptop, it captures your active Google session cookies and syncs them to `doc-to-sheets` via a Web App endpoint (`doPost`), keeping `DOC_COOKIE` fresh 24/7 without needing a dedicated server.
+
+See [chrome-cookie-tool README](../../chrome-cookie-tool/README.md) for extension installation and setup.
 
 ---
 
@@ -30,6 +42,7 @@ Google Apps Script that fetches the published BCA Class Cancellation List docume
 4. (Optional) If editing the manifest, enable "Show appsscript.json manifest file in editor" under Project Settings and copy [`doc-to-sheets/appsscript.json`](./doc-to-sheets/appsscript.json).
 5. **Script Properties** (optional):
    - `DOC_URL`: The published doc URL (defaults to the BCA cancellation list `/pub` URL).
+   - `DOC_COOKIE`: Session cookie string from your browser (required if the published doc has "Require viewers to sign in" enabled).
 6. **Automation**:
    - Run `createDocToSheetsFiveMinuteTrigger()` in the Apps Script editor to create a recurring time-driven trigger that runs every 5 minutes.
    - Alternatively, run `createDocToSheetsOneMinuteTrigger()` for 1-minute updates.
