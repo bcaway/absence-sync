@@ -204,15 +204,43 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Fetch registered teachers and aliases for canonical name resolution
+    const { data: teacherRows } = await supabase
+      .from("teachers")
+      .select("name, aliases");
+
+    const knownTeachers: Array<{ name: string; aliases: string[] }> = (teacherRows || []).map((t: any) => ({
+      name: t.name,
+      aliases: Array.isArray(t.aliases) ? t.aliases : [],
+    }));
+
+    function resolveTeacherName(raw: string): string {
+      const lower = raw.trim().toLowerCase();
+      for (const t of knownTeachers) {
+        if (t.name.trim().toLowerCase() === lower) return t.name;
+        for (const a of t.aliases) {
+          if (a.trim().toLowerCase() === lower) return t.name;
+        }
+      }
+      return raw.trim();
+    }
+
     const currentAbsences = normalizeAbsences(
       (currentRows ?? []).map((row) => ({
-        teacher: row.teacher,
+        teacher: resolveTeacherName(row.teacher),
         periods_impacted: row.periods_impacted,
       })),
     );
 
+    const canonicalIncoming = normalizeAbsences(
+      payload.absences.map((a) => ({
+        teacher: resolveTeacherName(a.teacher),
+        periods_impacted: a.periods_impacted,
+      })),
+    );
+
     const currentSnapshot = JSON.stringify(currentAbsences);
-    const incomingSnapshot = JSON.stringify(normalizedAbsences);
+    const incomingSnapshot = JSON.stringify(canonicalIncoming);
 
     /*
      * Nothing changed. Leave Supabase completely untouched.
@@ -223,8 +251,48 @@ Deno.serve(async (req) => {
         changed: false,
         cleared: false,
         date: today,
-        count: normalizedAbsences.length,
+        count: canonicalIncoming.length,
       });
+    }
+
+    /*
+     * Compute difference events for push notifications
+     */
+    const oldMap = new Map(currentAbsences.map(a => [a.teacher.toLowerCase(), a]));
+    const newMap = new Map(canonicalIncoming.map(a => [a.teacher.toLowerCase(), a]));
+
+    const absenceEvents: Array<{
+      type: "inserted" | "updated" | "removed";
+      teacher: string;
+      periodsImpacted?: string;
+    }> = [];
+
+    // Check for newly inserted or updated absences
+    for (const [key, newAbsence] of newMap.entries()) {
+      const oldAbsence = oldMap.get(key);
+      if (!oldAbsence) {
+        absenceEvents.push({
+          type: "inserted",
+          teacher: newAbsence.teacher,
+          periodsImpacted: newAbsence.periods_impacted,
+        });
+      } else if (oldAbsence.periods_impacted !== newAbsence.periods_impacted) {
+        absenceEvents.push({
+          type: "updated",
+          teacher: newAbsence.teacher,
+          periodsImpacted: newAbsence.periods_impacted,
+        });
+      }
+    }
+
+    // Check for removed absences
+    for (const [key, oldAbsence] of oldMap.entries()) {
+      if (!newMap.has(key)) {
+        absenceEvents.push({
+          type: "removed",
+          teacher: oldAbsence.teacher,
+        });
+      }
     }
 
     /*
@@ -258,7 +326,12 @@ Deno.serve(async (req) => {
     /*
      * Empty snapshot is valid. The table simply remains empty.
      */
-    if (normalizedAbsences.length === 0) {
+    if (canonicalIncoming.length === 0) {
+      // If there were removals, dispatch notifications
+      if (absenceEvents.length > 0) {
+        dispatchAbsenceNotifications(absenceEvents);
+      }
+
       return jsonResponse({
         success: true,
         changed: true,
@@ -270,7 +343,7 @@ Deno.serve(async (req) => {
 
     const syncedAt = new Date().toISOString();
 
-    const rowsToInsert = normalizedAbsences.map((absence) => ({
+    const rowsToInsert = canonicalIncoming.map((absence) => ({
       date: today,
       synced_at: syncedAt,
       teacher: absence.teacher,
@@ -293,13 +366,19 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Dispatch remote push notifications to Cloudflare Worker backend
+    if (absenceEvents.length > 0) {
+      await dispatchAbsenceNotifications(absenceEvents);
+    }
+
     return jsonResponse({
       success: true,
       changed: true,
       cleared: false,
       date: today,
-      count: normalizedAbsences.length,
+      count: canonicalIncoming.length,
       synced_at: syncedAt,
+      notifiedEvents: absenceEvents.length,
     });
   } catch (error) {
     console.error("Unexpected error:", error);
@@ -313,3 +392,29 @@ Deno.serve(async (req) => {
     );
   }
 });
+
+async function dispatchAbsenceNotifications(
+  events: Array<{ type: string; teacher: string; periodsImpacted?: string }>
+): Promise<void> {
+  const workerUrl =
+    Deno.env.get("NOTIFICATION_BACKEND_URL") ||
+    "https://bcaway-notifications.tjaynj.workers.dev";
+
+  try {
+    console.log(
+      `Dispatching ${events.length} absence notification event(s) to ${workerUrl}...`
+    );
+    const resp = await fetch(`${workerUrl}/notify-absence`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ events }),
+    });
+
+    const respText = await resp.text();
+    console.log(`Notification worker response (${resp.status}):`, respText);
+  } catch (err) {
+    console.error("Failed to dispatch absence notifications to worker:", err);
+  }
+}
