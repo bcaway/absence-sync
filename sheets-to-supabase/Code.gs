@@ -79,6 +79,15 @@ function syncAbsences(options) {
     const data = readSheet();
     const currentHash = computeDataHash(data);
     const props = PropertiesService.getScriptProperties();
+    const lastSyncTimeStr = props.getProperty("LAST_SYNC_TIME_MS");
+    const lastSyncTime = lastSyncTimeStr ? Number(lastSyncTimeStr) : 0;
+    const nowMs = Date.now();
+
+    if (!force && nowMs - lastSyncTime < 4000) {
+      console.log(`Debouncing rapid sheet sync (called within ${nowMs - lastSyncTime}ms of previous sync). Skipping.`);
+      return { skipped: true, reason: "debounced" };
+    }
+
     const lastHash = props.getProperty("LAST_SYNCED_HASH");
 
     if (!force && lastHash === currentHash) {
@@ -97,6 +106,7 @@ function syncAbsences(options) {
 
     props.setProperty("LAST_SYNCED_HASH", currentHash);
     props.setProperty("LAST_SYNCED_AT", new Date().toISOString());
+    props.setProperty("LAST_SYNC_TIME_MS", String(Date.now()));
 
     console.log(`Supabase sync completed successfully (hash: ${currentHash}).`);
     return { skipped: false, hash: currentHash, response: response };
