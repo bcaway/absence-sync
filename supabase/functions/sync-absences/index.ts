@@ -33,21 +33,48 @@ const ALL_PERIODS = [
 ];
 
 function normalizePeriods(rawValue: string): string {
+  if (!rawValue) return "";
+
+  let text = rawValue
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\u00A0/g, " ")
+    .trim();
+
+  // "all" always means every period.
+  if (/\ball\b/i.test(text)) {
+    return ALL_PERIODS.join(", ");
+  }
+
+  // Pre-normalize common connectors and words:
+  text = text
+    .replace(/\b(?:through|thru|to)\b/gi, "-")
+    .replace(/&|\band\b|\+|\/|;/gi, ",")
+    .replace(/\b(?:periods?|mods?|p\.?)\b/gi, " ")
+    .replace(/\s*-\s*/g, "-");
+
   const periods = new Set<string>();
 
-  const tokens = rawValue
+  const tokens = text
     .split(",")
     .map((token) => token.trim().toLowerCase())
     .filter(Boolean);
 
-  // "all" always means every period.
-  if (tokens.includes("all")) {
-    return ALL_PERIODS.join(", ");
-  }
-
   for (const token of tokens) {
     if (token === "igs") {
       periods.add("igs");
+      continue;
+    }
+
+    // Numerical range, e.g. 1-4, 2-5.
+    const rangeMatch = token.match(/^([1-9])-([1-9])$/);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      if (start <= end) {
+        for (let period = start; period <= end; period++) {
+          periods.add(String(period));
+        }
+      }
       continue;
     }
 
@@ -57,17 +84,11 @@ function normalizePeriods(rawValue: string): string {
       continue;
     }
 
-    // Numerical range, e.g. 2-5.
-    const rangeMatch = token.match(/^([1-9])-([1-9])$/);
-
-    if (rangeMatch) {
-      const start = Number(rangeMatch[1]);
-      const end = Number(rangeMatch[2]);
-
-      if (start <= end) {
-        for (let period = start; period <= end; period++) {
-          periods.add(String(period));
-        }
+    // Standalone digit fallback
+    const digits = token.match(/\b[1-9]\b/g);
+    if (digits) {
+      for (const d of digits) {
+        periods.add(d);
       }
     }
   }

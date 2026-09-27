@@ -310,19 +310,25 @@ function parsePeriodsCell(rawText) {
   if (!rawText) return "";
 
   // Normalize en-dashes, em-dashes, and whitespace
-  const text = rawText
+  let text = String(rawText)
     .replace(/[\u2013\u2014]/g, "-")
     .replace(/\u00A0/g, " ")
     .trim();
 
-  // Rule 1: If the word "all" in any case appears
+  // Rule 1: If the word "all" in any case appears (e.g. "all", "all day", "all mods")
   if (/\ball\b/i.test(text)) {
     return "All";
   }
 
+  // Pre-normalize common phrases and connectors
+  text = text
+    .replace(/\b(?:through|thru|to)\b/gi, "-")
+    .replace(/&|\band\b|\+|\/|;/gi, ",")
+    .replace(/\b(?:periods?|mods?|p\.?)\b/gi, " ");
+
   const parts = [];
 
-  // Rule 2: Pair of numbers with a hyphen between them (e.g. 1-3, 1-8, 1-9)
+  // Rule 2: Pair of numbers with a hyphen between them (e.g. 1-3, 1-8, 1 - 4)
   const hyphenRegex = /(\d+)\s*-\s*(\d+)/g;
   let match;
   while ((match = hyphenRegex.exec(text)) !== null) {
@@ -344,7 +350,18 @@ function parsePeriodsCell(rawText) {
     parts.push("igs");
   }
 
-  return parts.join(", ");
+  // Remove duplicates while preserving insertion order
+  const uniqueParts = [];
+  const seen = new Set();
+  for (const p of parts) {
+    const lower = p.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      uniqueParts.push(p);
+    }
+  }
+
+  return uniqueParts.join(", ");
 }
 
 
@@ -383,8 +400,10 @@ function writeDocDataToSheet(sheet, dateInfo, rows) {
     sheet.getRange(2, 1, lastRow - 1, 2).clearContent();
   }
 
-  // 3. Write rows starting at A2
+  // 3. Write rows starting at A2 with Column B explicitly set to Plain Text (@)
+  // This prevents Google Sheets from auto-coercing "1-4" to a date (Jan 4) or "7,8" to a number
   if (rows.length > 0) {
+    sheet.getRange(2, 2, rows.length, 1).setNumberFormat("@");
     sheet.getRange(2, 1, rows.length, 2).setValues(rows);
   }
 

@@ -177,16 +177,23 @@ function readSheet() {
 
   /*
    * Read columns A and B starting at row 2.
+   * We read both displayValues (for formatted text strings) and rawValues (to detect and unwrap coerced dates).
    */
-  const values = sheet
-    .getRange(2, 1, lastRow - 1, 2)
-    .getValues();
+  const range = sheet.getRange(2, 1, lastRow - 1, 2);
+  const displayValues = range.getDisplayValues();
+  const rawValues = range.getValues();
 
   const absences = [];
 
-  for (const row of values) {
-    const teacher = String(row[0] ?? "").trim();
-    const rawPeriods = String(row[1] ?? "").trim();
+  for (let i = 0; i < displayValues.length; i++) {
+    const teacher = String(displayValues[i][0] ?? "").trim();
+    let rawPeriods = String(displayValues[i][1] ?? "").trim();
+
+    // If Google Sheets coerced "1-4" into a Date (e.g. Jan 4), recover the period range
+    const rawVal = rawValues[i][1];
+    if (rawVal instanceof Date && (!rawPeriods || /^\d{1,2}\/\d{1,2}/.test(rawPeriods))) {
+      rawPeriods = `${rawVal.getMonth() + 1}-${rawVal.getDate()}`;
+    }
 
     /*
      * Ignore completely empty rows.
@@ -290,63 +297,66 @@ function parseSheetDate(value) {
  * - Duplicate periods are automatically removed.
  */
 function parsePeriods(rawValue) {
-  const tokens = String(rawValue)
+  if (!rawValue) return "";
+
+  // Normalize en-dashes, em-dashes, non-breaking spaces, and whitespace
+  let text = String(rawValue)
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\u00A0/g, " ")
+    .trim();
+
+  // "all" or "all day" -> full day
+  if (/\ball\b/i.test(text)) {
+    return "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9";
+  }
+
+  // Pre-normalize common connectors and words:
+  // e.g. "Periods 1-4" -> "1-4", "7 & 8" -> "7, 8", "1 to 4" -> "1-4", "7 and 8" -> "7, 8"
+  text = text
+    .replace(/\b(?:through|thru|to)\b/gi, "-")
+    .replace(/&|\band\b|\+|\/|;/gi, ",")
+    .replace(/\b(?:periods?|mods?|p\.?)\b/gi, " ")
+    .replace(/\s*-\s*/g, "-");
+
+  const tokens = text
     .split(",")
     .map((token) => token.trim().toLowerCase())
     .filter((token) => token.length > 0);
 
-  if (tokens.some((token) => token === "all" || token === "all day")) {
-    return "igs, 1, 2, 3, 4, 5, 6, 7, 8, 9";
-  }
-
   const periods = new Set();
 
   for (const token of tokens) {
-    /*
-     * IGS.
-     */
+    // IGS
     if (token === "igs") {
       periods.add("igs");
       continue;
     }
 
-    /*
-     * Single numerical period.
-     * Only 1 through 9 are valid.
-     */
-    if (/^\d+$/.test(token)) {
-      const period = Number(token);
-
-      if (period >= 1 && period <= 9) {
-        periods.add(String(period));
-      }
-
-      continue;
-    }
-
-    /*
-     * Numerical range.
-     * Examples: 1-3, 2-9
-     */
-    const rangeMatch = token.match(/^(\d+)\s*-\s*(\d+)$/);
-
+    // Numerical range: e.g. 1-4, 7-9
+    const rangeMatch = token.match(/^([1-9])-([1-9])$/);
     if (rangeMatch) {
       const start = Number(rangeMatch[1]);
       const end = Number(rangeMatch[2]);
-
-      if (
-        start >= 1 &&
-        start <= 9 &&
-        end >= 1 &&
-        end <= 9 &&
-        start <= end
-      ) {
+      if (start <= end) {
         for (let period = start; period <= end; period++) {
           periods.add(String(period));
         }
       }
-
       continue;
+    }
+
+    // Single numerical period (1-9)
+    if (/^[1-9]$/.test(token)) {
+      periods.add(token);
+      continue;
+    }
+
+    // Fallback: extract any standalone digits 1-9 within the token
+    const digits = token.match(/\b[1-9]\b/g);
+    if (digits) {
+      for (const d of digits) {
+        periods.add(d);
+      }
     }
   }
 
